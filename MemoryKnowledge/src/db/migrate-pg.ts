@@ -185,6 +185,33 @@ const DDL = `
     ingest_error     TEXT,
     PRIMARY KEY (wiki_id, filename)
   );
+
+  -- Wiki content (the filesystem keeps these under the wiki directory; see engines/wiki/content-store-pg.ts).
+  -- Pages are the wiki/**.md files by project-relative path; sources the raw/sources/** files as bytes.
+  CREATE TABLE IF NOT EXISTS knowledge_wiki_page_file (
+    wiki_id    TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (wiki_id, path)
+  );
+
+  CREATE TABLE IF NOT EXISTS knowledge_wiki_source_file (
+    wiki_id    TEXT NOT NULL,
+    filename   TEXT NOT NULL,
+    data       BYTEA NOT NULL,
+    size       BIGINT NOT NULL,
+    sha256     TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (wiki_id, filename)
+  );
+
+  -- The wiki engine manager's registry (upstream: _wiki_engines/wiki-sources.json), one row per wiki.
+  CREATE TABLE IF NOT EXISTS knowledge_wiki_registry (
+    name       TEXT PRIMARY KEY,
+    state      JSONB NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `;
 
 /** Validated identifier: the schema name is interpolated into DDL, so no quoting games. */

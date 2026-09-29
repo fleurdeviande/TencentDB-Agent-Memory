@@ -57,6 +57,7 @@ export async function createApp() {
     tmcCallbackUrl: config.tmcCallbackUrl,
     git: config.git,
     secretKey: config.secrets.secretKey,
+    maxSourceBytes: config.maxSourceBytes,
   });
 
   // Hono app

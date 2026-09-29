@@ -12,9 +12,8 @@
  * （如仅 `# Wiki Schema\n\nDefine ... here.`），这类视为"无有效内容"，用默认。
  */
 
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
 import { parseFrontmatter } from "./frontmatter.js";
+import type { PageTree } from "../page-tree.js";
 
 export interface WikiTemplate {
   /** purpose.md 的有效正文（去 frontmatter），无则为默认。 */
@@ -68,11 +67,10 @@ function hasMeaningfulContent(body: string): boolean {
   return stripped.length >= 8;
 }
 
-function readTemplateFile(projectPath: string, name: string): string | null {
-  const full = join(projectPath, "wiki", name);
-  if (!existsSync(full)) return null;
+function readTemplateFile(tree: PageTree, name: string): string | null {
+  const content = tree.get(`wiki/${name}`);
+  if (content === undefined) return null;
   try {
-    const content = readFileSync(full, "utf-8");
     const { body } = parseFrontmatter(content);
     const trimmed = body.trim();
     if (!trimmed || !hasMeaningfulContent(trimmed)) return null;
@@ -85,9 +83,9 @@ function readTemplateFile(projectPath: string, name: string): string | null {
 /**
  * 加载抽取模板。存在且有实质内容则用用户的；否则用领域中立默认。
  */
-export function loadTemplate(projectPath: string): WikiTemplate {
-  const purpose = readTemplateFile(projectPath, "purpose.md");
-  const schema = readTemplateFile(projectPath, "schema.md");
+export function loadTemplate(tree: PageTree): WikiTemplate {
+  const purpose = readTemplateFile(tree, "purpose.md");
+  const schema = readTemplateFile(tree, "schema.md");
   return {
     purpose: purpose ?? DEFAULT_PURPOSE,
     schema: schema ?? DEFAULT_SCHEMA,

@@ -1,31 +1,29 @@
 /**
- * Wiki index lifecycle through WikiService + WikiSourceManager on the test dialect (SQLite index.db by
- * default, Postgres rows with KNOWLEDGE_TEST_DB_URL): upload → ingest → search (English, Chinese) →
+ * Wiki index lifecycle through WikiService + WikiSourceManager on the test dialect (SQLite index.db and
+ * files by default, Postgres rows with KNOWLEDGE_TEST_DB_URL): upload → ingest → search (English, Chinese) →
  * graph → restart → delete. The LLM stages of ingest-v2 are stubbed: each source file is its own page.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { PageTree } from "./page-tree.js";
 
 const extractCalls: string[] = [];
 
 vi.mock("./ingest-v2/index.js", () => ({
   scanExistingPages: () => [],
-  extractSource: async (_projectPath: string, abs: string) => {
-    extractCalls.push(basename(abs));
-    return new Map([[`wiki/concepts/${basename(abs)}`, readFileSync(abs, "utf-8")]]);
+  extractSource: async (_tree: PageTree, source: { name: string; text: string }) => {
+    extractCalls.push(source.name);
+    return new Map([[`wiki/concepts/${source.name}`, source.text]]);
   },
-  commitCandidates: async (
-    projectPath: string,
-    all: Array<{ sourceFilename: string; candidates: Map<string, string> }>,
-  ) => {
+  commitCandidates: async (tree: PageTree, all: Array<{ sourceFilename: string; candidates: Map<string, string> }>) => {
     const written: string[] = [];
     for (const { candidates } of all) {
       for (const [rel, content] of candidates) {
-        mkdirSync(dirname(join(projectPath, rel)), { recursive: true });
-        writeFileSync(join(projectPath, rel), content, "utf-8");
+        tree.set(rel, content);
         written.push(rel);
       }
     }
@@ -39,6 +37,7 @@ import { createTestDb, TEST_DIALECT, type TestDb } from "../../test-utils/db.js"
 import { SqliteKnowledgeStore } from "../../store/sqlite-store.js";
 import { WikiService } from "../../store/wiki-service.js";
 import { createWikiIndexStore, type WikiIndexStore } from "./index-store.js";
+import { createWikiContentStore } from "./content-store.js";
 import { createWikiSourceManager, type WikiSourceManager } from "./manager.js";
 
 const SVC = "svc-A";
@@ -61,15 +60,18 @@ interface Stack {
 
 /** One "process": manager + service over the shared DB and data dir. */
 async function boot(): Promise<Stack> {
-  const mgr = await createWikiSourceManager(join(root, "_wiki_engines"), { index });
+  // Content like module.ts: upstream files on SQLite, Postgres rows on Postgres.
+  const content = createWikiContentStore(db, { registryDir: join(root, "_wiki_engines") });
+  const mgr = await createWikiSourceManager(join(root, "_wiki_engines"), { index, content });
   const service = new WikiService({
     store: new SqliteKnowledgeStore(db),
     dataRoot: root,
     wikiIndex: index,
+    wikiContent: content,
     worker: async (ctx) => {
       await mgr.init({ name: ctx.wikiId, path: ctx.dir });
       await mgr.ingest(ctx.wikiId, {});
-      return { pageCount: mgr.getPages(ctx.wikiId).length };
+      return { pageCount: (await mgr.getPages(ctx.wikiId)).length };
     },
   });
   return { mgr, service };

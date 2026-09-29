@@ -37,6 +37,9 @@ export interface WikiRouteDeps {
   publicBaseUrl: string;
 }
 
+/** Standard base64 with padding. */
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
 /** Handle WriteOutcome error codes → HTTP response. Returns Response if handled, null otherwise. */
 function maybeWriteError(outcome: unknown): Response | null {
   if (outcome === null) return Response.json(wrapError(404, "wiki not found"), { status: 404 });
@@ -234,8 +237,13 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const row = await wikiService.getById(serviceId, wikiId);
     if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
+    const encoding = body.encoding;
+    if (encoding !== undefined && encoding !== "utf-8" && encoding !== "base64") {
+      return c.json(wrapError(400, 'encoding must be "utf-8" or "base64"'), 400);
+    }
+
     try {
-      const result = await wikiService.rawReadMany(serviceId, row.team_id, wikiId, filenames);
+      const result = await wikiService.rawReadMany(serviceId, row.team_id, wikiId, filenames, { encoding });
       const err = maybeWriteError(result);
       if (err) return err;
       return c.json(wrapOk({ items: result }));
@@ -268,7 +276,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     }
     let totalSize = 0;
 
-    const validated: { filename: string; content: string }[] = [];
+    const validated: { filename: string; content: string | Buffer }[] = [];
     for (const item of files) {
       if (!item || typeof item !== "object") {
         return c.json(wrapError(400, "files items must be {filename, content}"), 400);
@@ -280,12 +288,21 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       if (typeof r.content !== "string") {
         return c.json(wrapError(400, "content must be string for each file"), 400);
       }
-      const size = Buffer.byteLength(r.content, "utf-8");
+      // Binary sources travel as base64 (`encoding: "base64"`); the limits apply to the decoded bytes.
+      if (r.encoding !== undefined && r.encoding !== "utf-8" && r.encoding !== "base64") {
+        return c.json(wrapError(400, `encoding must be "utf-8" or "base64": ${r.filename}`), 400);
+      }
+      let content: string | Buffer = r.content;
+      if (r.encoding === "base64") {
+        if (!BASE64_RE.test(r.content)) return c.json(wrapError(400, `content is not valid base64: ${r.filename}`), 400);
+        content = Buffer.from(r.content, "base64");
+      }
+      const size = typeof content === "string" ? Buffer.byteLength(content, "utf-8") : content.length;
       if (size > MAX_FILE_SIZE) {
         return c.json(wrapError(413, `file too large: ${r.filename} (max ${MAX_FILE_SIZE} bytes)`), 413);
       }
       totalSize += size;
-      validated.push({ filename: r.filename, content: r.content });
+      validated.push({ filename: r.filename, content });
     }
     if (totalSize > MAX_TOTAL) {
       return c.json(wrapError(413, `total too large (max ${MAX_TOTAL} bytes)`), 413);

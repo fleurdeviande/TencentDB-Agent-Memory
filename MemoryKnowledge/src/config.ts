@@ -117,6 +117,8 @@ export interface ServiceConfig {
   dbSchema: string;
   /** KNOWLEDGE_DB_POOL_MAX: Postgres pool size. */
   dbPoolMax: number;
+  /** KNOWLEDGE_MAX_SOURCE_BYTES: largest wiki source the content store accepts (bytes, default 50 MiB). */
+  maxSourceBytes: number;
   /** LLM configuration for wiki ingest. */
   llm: LlmConfig;
   /** Log level. */
@@ -145,6 +147,15 @@ function envInt(key: string, fallback: number): number {
   if (val === undefined || val === "") return fallback;
   const n = parseInt(val, 10);
   return Number.isNaN(n) ? fallback : n;
+}
+
+/** A positive integer env var; anything else fails at startup instead of being silently replaced. */
+function positiveInt(key: string, fallback: number): number {
+  const val = process.env[key];
+  if (val === undefined || val === "") return fallback;
+  const n = Number(val);
+  if (!Number.isSafeInteger(n) || n < 1) throw new Error(`${key} must be a positive integer (bytes): ${val}`);
+  return n;
 }
 
 function clamp(n: number, min: number, max: number): number {
@@ -222,6 +233,7 @@ export function loadConfig(): ServiceConfig {
     dbUrl: env("KNOWLEDGE_DB_URL", ""),
     dbSchema: env("KNOWLEDGE_DB_SCHEMA", ""),
     dbPoolMax: clamp(envInt("KNOWLEDGE_DB_POOL_MAX", 10), 1, 100),
+    maxSourceBytes: positiveInt("KNOWLEDGE_MAX_SOURCE_BYTES", 50 * 1024 * 1024),
     logLevel: env("LOG_LEVEL", "debug"),
     apiPrefix: env("API_PREFIX", "/v3"),
     publicBaseUrl: env("KNOWLEDGE_PUBLIC_BASE_URL", ""),
