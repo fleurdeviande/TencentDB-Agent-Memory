@@ -569,7 +569,10 @@ export async function runIngestIncremental(
   const disk = await content.listSources(loc, isIngestibleSource);
   const tree = await PageTree.load(content, loc);
 
-  const { toIngest, skipped, deleted } = classifySources(disk, oldStates);
+  // Only extractable sources take part: upstream also counted every other upload (e.g. a binary) as
+  // "deleted" and removed it on the first ingest.
+  const extractableStates = new Map([...oldStates].filter(([filename]) => isIngestibleSource(filename)));
+  const { toIngest, skipped, deleted } = classifySources(disk, extractableStates);
   const skippedCount = skipped.length;
   const toIngestSet = new Set(toIngest);
   const toIngestDisk = disk.filter((d) => toIngestSet.has(d.filename));
