@@ -139,3 +139,7 @@ MemoryCore/scripts/bench-l0-mongo/reports/
 # Local-only: parity snapshots & runtime configs (never commit)
 MemoryProxy/.archive-tmp/
 z_config/
+
+# pw local stack: secrets and runtime state
+deploy/pw/.env.local
+deploy/pw/.run/
