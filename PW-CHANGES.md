@@ -92,7 +92,7 @@ isolation holding across teams.
 | package | result |
 |---|---|
 | MemoryCore | vitest 27/27 upstream baseline; 93/93 with the postgres backend and contract runners; 244/244 with postgres metadata and personal keys |
-| MemoryKnowledge | vitest 161/161 upstream baseline; 186 + 5 skipped on SQLite, 190 + 1 skipped on Postgres (wiki index included) |
+| MemoryKnowledge | vitest 161/161 upstream baseline; 195 + 5 skipped on SQLite, 199 + 1 skipped on Postgres (wiki index and wiki files included) |
 | MemoryCore/claude-code-plugin | tsc clean, vitest 17/17 |
 | pw/mcp | tsc clean, vitest 41/41, smoke OK (incl. a personal-key pass) |
 
@@ -222,9 +222,10 @@ stays on disk.
 | `KNOWLEDGE_DB_POOL_MAX` | `10` | `pg.Pool` size (1–100). |
 | `KNOWLEDGE_DB_PATH` | `./data/knowledge.db` | unchanged; used only when `KNOWLEDGE_DB_URL` is empty. |
 | `KNOWLEDGE_TEST_DB_URL` | empty | tests only: run the DB-backed suites on Postgres, one throw-away `kt_<pid>_<rand>` schema per test DB. |
+| `KNOWLEDGE_MAX_SOURCE_BYTES` | `52428800` (50 MiB) | largest wiki source the content store accepts, either dialect; over it → 413. A non-positive-integer value fails at startup. See "Wiki files on Postgres". |
 
-Code-graph checkouts/indexes and the wikis' `.md` pages and raw sources stay under `KNOWLEDGE_DATA_DIR` on
-either dialect; with `KNOWLEDGE_DB_URL` set, the wiki index moves into Postgres (below).
+Code-graph checkouts/indexes stay under `KNOWLEDGE_DATA_DIR` on either dialect. With `KNOWLEDGE_DB_URL` set,
+the wiki index (below) and the wiki pages, sources and registry ("Wiki files on Postgres") live in Postgres.
 
 ### What changed
 
@@ -261,7 +262,7 @@ store-level tests). The credential-store and route suites were switched to `crea
 
 With `KNOWLEDGE_DB_URL` set, the per-wiki index moves from one `index.db` per wiki into the metadata
 database, keyed by `wiki_id`; without it upstream's SQLite files are used, with upstream's SQL unchanged.
-The wiki `.md` pages and raw sources stay on disk.
+The wiki `.md` pages and raw sources stayed on disk in this step (moved later — "Wiki files on Postgres").
 
 - **Interface.** `src/engines/wiki/index-store.ts` — `WikiIndexStore`: `init`, `withWrite(fn)` (one
   transaction, serialised per wiki; writer: `replacePages`, `upsertSource`, `recordSourceIngestResult`,
@@ -349,6 +350,91 @@ read or write. `{wiki}` = `{KNOWLEDGE_DATA_DIR}/{service_id}/{team_id}/{wiki_id}
 
 Not wiki: `{KNOWLEDGE_DATA_DIR}/{service_id}/{team_id}/{code_graph_id}` (Code-Graph checkouts + codegraph
 index), `_git_known_hosts/`, temp git-auth dirs under the OS tmpdir, and `KNOWLEDGE_DB_PATH` (SQLite only).
+
+#### Abstraction
+
+- **`WikiContentStore`** (`src/engines/wiki/content-store.ts`): `init(loc, dirs)`, `hasPages`, `listPages`,
+  `readPage`, `applyPages({put, remove})` (all or nothing), `listSources(loc, match?)` → `{filename, size,
+  sha256}`, `readSource` → `Buffer`, `writeSources` (all or nothing, size-checked first), `deleteSources`,
+  `drop`, `loadRegistry` / `putRegistry` / `removeRegistry`. A wiki is a `WikiLoc {wikiId, dir}`: the
+  filesystem uses `dir`, Postgres `wikiId`. Page paths are project-relative `wiki/…`, source names relative
+  to `raw/sources/`; both are validated again inside the store (no `..`, no absolute, normalised).
+- **Filesystem** (`FsWikiContentStore`, default and SQLite mode): upstream's layout and write rules —
+  the same directories, `raw/sources/` created on wiki create (nested source names still need their
+  directory), write-then-rollback batches, `rm -rf` of the wiki dir on delete, the registry JSON rewritten
+  whole on every change.
+- **Postgres** (`content-store-pg.ts`, selected by `createWikiContentStore(db)` when the metadata DB is
+  Postgres, on `KnowledgeDb.pgPool`): `knowledge_wiki_page_file (wiki_id, path, content text)`,
+  `knowledge_wiki_source_file (wiki_id, filename, data bytea, size, sha256)`,
+  `knowledge_wiki_registry (name, state jsonb)` — idempotent DDL in `migrate-pg.ts` under the existing
+  migration advisory lock. Batches run in one transaction under `pg_advisory_xact_lock(<"wikc">, hashtext(wiki_id))`,
+  a namespace of their own so a content write never waits on an index write of the same wiki. All SQL is
+  parameterised; wiki ids and paths are never interpolated. `drop` deletes the wiki's page, source and
+  registry rows (the registry row too, because a build finishing after the delete can re-put it).
+- **`PageTree`** (`page-tree.ts`): the ingest pipeline and the two delete cascades walk and rewrite many
+  pages synchronously, so they now run on an in-memory copy loaded from the store and written back with
+  one `flush` (changed and removed pages only). `ingest-v2` (`extractSource`, `commitCandidates`,
+  `scanExistingPages`, `index-builder`, `log-writer`, `overview`, `template`, `cascade`) takes a `PageTree`
+  instead of a project path; `extractSource` gets the source as `{name, text}`. The manager's scan,
+  restart restore, `initWikiProject` and registry, and `WikiService`'s `raw/*` / `page/*`, go through the
+  store directly. `getPages` / `readPage` on the manager became async.
+- **Binary sources.** `raw/write` items take `encoding: "base64"` (validated; size limits apply to the
+  decoded bytes) and `raw/read` takes `encoding: "base64"`; default stays UTF-8 text. Source sha256 is
+  computed over the bytes (identical to upstream's for UTF-8 text).
+- **Size limit.** `KNOWLEDGE_MAX_SOURCE_BYTES` (default 50 MiB) is enforced by the store on both dialects
+  before anything is written: `SourceTooLargeError` (status 413) → `WikiService` `"too_large"` → HTTP 413.
+  Upstream's tighter limits still apply in front of it (route: 512 KiB per file / 5 MiB per request;
+  service: 5 MiB per file), so through today's HTTP API it is a backstop, reachable only by lowering it.
+
+#### What remains on disk with `KNOWLEDGE_DB_URL`
+
+Nothing of a wiki: no `{wiki}` directory is created, no `_wiki_engines/`, no `index.db`, no `_debug/`
+(unparsable LLM output goes to the log at `warn`, first 4 000 characters). The test asserts the whole
+data dir is empty after create → upload → ingest. What does live under `KNOWLEDGE_DATA_DIR` in that mode:
+Code-Graph checkouts and codegraph indexes (`{service}/{team}/{code_graph_id}`, third-party, out of scope)
+and `_git_known_hosts/known_hosts` once an SSH fetch writes it; git-auth key files go to the OS tmpdir.
+
+**Temp-file materialisation: none.** No wiki stage needs a real path — sources are `.md`/`.txt` text
+handed to the LLM as strings, and nothing hands a path to a third-party parser. Code-Graph is the only
+path-bound consumer and stays on disk by decision.
+
+#### Memory
+
+- A stored source is read and written whole: node-postgres materialises `bytea` as a `Buffer` from its hex
+  text, so a source costs about three times its size in flight — ≤ ~150 MB per request at the 50 MiB cap.
+  Ingest reads only the sources it extracts, one per concurrent extraction (`listSources` returns size and
+  sha256 without the bytes).
+- `PageTree` holds all pages of one wiki while an ingest or cascade runs (page/write caps a page at 512 KiB).
+
+#### Behaviour vs upstream (both dialects)
+
+- Ingest and cascades write their pages at the end in one batch instead of file by file; a failure before
+  the flush leaves the stored pages untouched (upstream kept what it had written so far). Unchanged pages
+  are not rewritten.
+- Non-`.md`/`.txt` sources are no longer classified as "deleted" by ingest. Upstream removed any such
+  upload (and its `source` row) on the first ingest, which would have destroyed every binary source.
+- A missing `raw/sources/` no longer short-circuits ingest; it reads as "no sources".
+- Source names are normalised (`./a.md` → `a.md`) before they are stored and registered; upstream stored
+  the file normalised but registered the raw name.
+- Postgres `text` cannot hold NUL, so a page containing `\u0000` fails to store on Postgres (page/write answers 400 with the driver error; not covered by a test).
+
+Tests: `content-store.test.ts` (store contract on the test dialect: pages, filter, traversal, text and
+binary sources, 413 without partial writes, registry, drop) and `wiki-files.test.ts` (`createKnowledgeModule`
++ `/wiki` routes, only the LLM client stubbed, so the real extract/merge/index.md/log.md/overview run:
+create → upload markdown + base64 binary (+ one source the stub cannot parse) → 413 → ingest → search/graph →
+data dir empty (Postgres) or upstream's files incl. `_debug/` (SQLite) → restart on a fresh data dir →
+pages, raw bytes and search → raw/rm cascade → delete → zero rows in `knowledge_wiki`, `knowledge_wiki_page`,
+`_edge`, `_source`, `_page_file`, `_source_file`, `_registry`). `wiki-index-lifecycle.test.ts` now wires the
+content store like `module.ts`. Audit rows (`knowledge_wiki_audit`) outlive the wiki by design.
+
+| run | result |
+|---|---|
+| `npx vitest run` (SQLite) | 195 passed, 5 skipped (Postgres-only), exit 0 |
+| `KNOWLEDGE_TEST_DB_URL=postgres://tdai:tdai-dev@127.0.0.1:55432/tdai_knowledge npx vitest run` | 199 passed, 1 skipped (SQLite-only), exit 0 |
+| `tsc --noEmit` | only the known `response-envelope.ts:57` error (exit 2) |
+
+Not ported: no copy of existing files into Postgres. Switching an install to `KNOWLEDGE_DB_URL` starts with
+no pages, sources or registry; existing wiki directories are ignored (and not deleted).
 
 ## MemoryCore metadata on PostgreSQL (`pw/postgres-metadata`)
 
