@@ -192,7 +192,15 @@ export interface TcvdbConfig {
 }
 
 /** Storage backend type. */
-export type StoreBackend = "sqlite" | "tcvdb" | "mongodb";
+export type StoreBackend = "sqlite" | "tcvdb" | "mongodb" | "postgres";
+
+/** PostgreSQL + pgvector backend (storeBackend = "postgres"). POSTGRES_URL / POSTGRES_SCHEMA env win. */
+export interface PostgresConfig {
+  /** Connection URL, e.g. postgres://user:pass@host:5432/db. */
+  url: string;
+  /** Base schema; non-default instances get derived schemas. Default "tdai". */
+  schema: string;
+}
 
 /** Report settings — controls metric/event reporting. */
 export interface ReportConfig {
@@ -352,6 +360,8 @@ export interface MemoryTdaiConfig {
   storeBackend: StoreBackend;
   /** Tencent Cloud VectorDB configuration (required when storeBackend = "tcvdb") */
   tcvdb: TcvdbConfig;
+  /** PostgreSQL configuration (used when storeBackend = "postgres") */
+  postgres?: PostgresConfig;
   /** BM25 sparse vector encoding (local @tencentdb-agent-memory/tcvdb-text) */
   bm25: BM25Config;
   /** Local JSONL cleanup settings */
@@ -511,6 +521,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
   const storeBackend: StoreBackend =
     storeBackendRaw === "tcvdb" ? "tcvdb"
     : storeBackendRaw === "mongodb" ? "mongodb"
+    : storeBackendRaw === "postgres" ? "postgres"
     : "sqlite";
 
   // --- TCVDB config ---
@@ -646,6 +657,10 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       embeddingModel: str(tcvdbGroup, "embeddingModel") ?? "bge-large-zh",
       timeout: num(tcvdbGroup, "timeout") ?? 10000,
       caPemPath: str(tcvdbGroup, "caPemPath") || undefined,
+    },
+    postgres: {
+      url: str(obj(c, "postgres"), "url") ?? "",
+      schema: str(obj(c, "postgres"), "schema") ?? "",
     },
     bm25: {
       enabled: bool(bm25Group, "enabled") ?? true,

@@ -7,6 +7,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { readPostgresEnvConfig } from "../../../utils/env-config.js";
 
 export interface PostgresStoreConfig {
   /** libpq connection string, e.g. postgres://user:pass@host:5432/db. */
@@ -39,4 +40,29 @@ export function schemaForInstance(baseSchema: string, instanceId: string): strin
   const hash = createHash("sha256").update(instanceId).digest("hex").slice(0, 10);
   // base (≤ 26 chars kept) + "_i_" + slug + "_" + hash stays within 63.
   return assertSchemaName(`${baseSchema.slice(0, 26)}_i_${slug}_${hash}`);
+}
+
+/**
+ * Effective connection settings: POSTGRES_URL / POSTGRES_SCHEMA env win over
+ * the `memory.postgres` config block (secrets usually arrive as env).
+ */
+export function resolvePostgresStoreConfig(cfg?: {
+  url?: string;
+  schema?: string;
+}): Required<Pick<PostgresStoreConfig, "url" | "schema">> {
+  const env = readPostgresEnvConfig();
+  return {
+    url: env.url || cfg?.url || "",
+    schema: assertSchemaName(env.schema || cfg?.schema || DEFAULT_POSTGRES_SCHEMA),
+  };
+}
+
+/** host:port/db for logs and manifests — never the credentials. */
+export function describePostgresUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.hostname}${u.port ? `:${u.port}` : ""}${u.pathname}`;
+  } catch {
+    return "(unparseable POSTGRES_URL)";
+  }
 }

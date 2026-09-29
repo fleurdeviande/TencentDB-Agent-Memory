@@ -108,6 +108,15 @@ if [[ "$MEMORY_CORE_STORE_MODE" == "mongodb" ]]; then
   info "memory-core 数据面后端 = mongodb（endpoint=$MONGODB_ENDPOINT, db=$MONGODB_DATABASE）"
 fi
 
+# MEMORY_CORE_STORE_MODE=postgres: data plane on PostgreSQL + pgvector (external instance).
+PG_ENV_ARGS=()
+if [[ "$MEMORY_CORE_STORE_MODE" == "postgres" ]]; then
+  [[ -n "${POSTGRES_URL:-}" ]] || die "MEMORY_CORE_STORE_MODE=postgres requires POSTGRES_URL"
+  PG_ENV_ARGS+=( -e "POSTGRES_URL=$POSTGRES_URL" )
+  [[ -n "${POSTGRES_SCHEMA:-}" ]] && PG_ENV_ARGS+=( -e "POSTGRES_SCHEMA=$POSTGRES_SCHEMA" )
+  info "memory-core data plane = postgres (schema=${POSTGRES_SCHEMA:-tdai})"
+fi
+
 if [[ "$MEMORY_CORE_METADATA_BACKEND" == "mongodb" ]]; then
   # 元数据默认与数据面共用同一 Mongo 实例（不同库：{prefix}_{instance_id}，默认前缀 tdai_metadata）。
   # 注意：元数据 client 自建、不经共享连接池，且不继承数据面的 w:1（事务持久性依赖服务端默认 majority）。
@@ -213,6 +222,7 @@ $DOCKER run -d --name "$CONTAINER" \
   -e TDAI_DATA_DIR=/data/tdai-memory \
   -e STORE_MODE="$MEMORY_CORE_STORE_MODE" \
   ${MONGO_ENV_ARGS[@]+"${MONGO_ENV_ARGS[@]}"} \
+  ${PG_ENV_ARGS[@]+"${PG_ENV_ARGS[@]}"} \
   "$MEMORY_CORE_IMAGE" >/dev/null
 
 wait_healthy "$CONTAINER" 90

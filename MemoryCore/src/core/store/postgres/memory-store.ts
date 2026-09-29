@@ -378,7 +378,9 @@ export class PostgresMemoryStore implements IMemoryStore {
       .map(Number);
     this.iterativeScan = major > 0 || minor >= 8;
 
-    const current: EmbeddingMeta | null = providerInfo
+    // A Noop embedder (provider "noop") produces no vectors and must not pin the contract.
+    const current: EmbeddingMeta | null =
+      providerInfo && providerInfo.provider !== "noop"
       ? {
           provider: providerInfo.provider,
           model: providerInfo.model,
@@ -419,7 +421,7 @@ export class PostgresMemoryStore implements IMemoryStore {
     }
     this.activeDims = this.dimensions;
 
-    if (current && saved && contractKey(saved) !== contractKey(current)) {
+    if (current && saved && contractKey(saved) !== contractKey(current) && (await this.embeddedRowCount()) > 0) {
       this.vectorIoBlocked = true;
       this.targetMeta = current;
       const reason = `embedding contract: ${contractKey(saved)} → ${contractKey(current)}`;

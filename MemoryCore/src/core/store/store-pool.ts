@@ -28,6 +28,13 @@ import { MongoMemoryStore } from "./mongodb/memory-store.js";
 import { MongoSkillStore } from "./mongodb/skill-store.js";
 import { getSharedMongoClientPool } from "./mongodb/client-pool.js";
 import type { MongoClientPool } from "./mongodb/client-pool.js";
+import {
+  closeSharedPostgresPools,
+  createPostgresEmbeddingService,
+  createPostgresStoreForInstance,
+  resolvePostgresStoreConfig,
+  schemaForInstance,
+} from "./postgres/index.js";
 import { createBM25Encoder } from "./bm25-local.js";
 import type { BM25LocalEncoder } from "./bm25-local.js";
 import type { VdbConfig, MongoConfig } from "../instance-config-provider.js";
@@ -60,7 +67,7 @@ interface Logger {
   error: (message: string) => void;
 }
 
-export type StoreMode = "sqlite" | "tcvdb" | "mongodb";
+export type StoreMode = "sqlite" | "tcvdb" | "mongodb" | "postgres";
 
 export interface KafkaMetricOptions {
   /** Kafka Broker 列表 (逗号分隔或数组) */
@@ -184,12 +191,14 @@ export class StorePool {
     // mongoConfig present → mongodb; else tcvdb when in tcvdb mode with a vdb;
     // else sqlite. `mode` is the process default that drives which config the
     // caller resolves, but the presence check is authoritative here.
+    // postgres is process-level (POSTGRES_URL): no per-instance conn, the instance picks its schema.
     const backend: StoreMode = mongoConfig
       ? "mongodb"
-      : (this.mode === "tcvdb" && vdbConfig ? "tcvdb" : "sqlite");
+      : (this.mode === "tcvdb" && vdbConfig ? "tcvdb" : this.mode === "postgres" ? "postgres" : "sqlite");
     const fingerprint =
       backend === "mongodb" && mongoConfig ? this.computeMongoFingerprint(mongoConfig)
       : backend === "tcvdb" && vdbConfig ? this.computeFingerprint(vdbConfig)
+      : backend === "postgres" ? this.computePostgresFingerprint(instanceId)
       : `sqlite:${instanceId}`;
     const cached = this.pool.get(instanceId);
 
@@ -214,6 +223,7 @@ export class StorePool {
     const pooledStore =
       backend === "mongodb" && mongoConfig ? this.createMongoStore(mongoConfig)
       : backend === "tcvdb" && vdbConfig ? this.createTcvdbStore(vdbConfig)
+      : backend === "postgres" ? this.createPostgresStore(instanceId)
       : this.createSqliteStore(instanceId);
 
     this.pool.set(instanceId, {
@@ -225,6 +235,7 @@ export class StorePool {
     const storeDesc =
       backend === "mongodb" && mongoConfig ? `mongodb ${mongoConfig.endpoint} / ${mongoConfig.database}`
       : backend === "tcvdb" && vdbConfig ? `${vdbConfig.url} / ${vdbConfig.database}`
+      : backend === "postgres" ? `postgres schema ${this.postgresSchema(instanceId)}`
       : `sqlite @ ${this.getSqlitePath(instanceId)}`;
     this.logger.info(
       `${TAG} Created ${backend} store for ${instanceId}: ${storeDesc} (pool size: ${this.pool.size})`,
@@ -327,6 +338,10 @@ export class StorePool {
         this.logger.warn(`${TAG} Error closing shared MongoClient pool: ${e}`);
       }
       this.mongoPool = undefined;
+    }
+
+    if (this.mode === "postgres") {
+      await closeSharedPostgresPools();
     }
 
     this.logger.info(`${TAG} All stores closed (${entries.length} memory + skill caches cleared)`);
@@ -481,6 +496,28 @@ export class StorePool {
 
   private computeMongoFingerprint(mongoConfig: MongoConfig): string {
     return `mongodb:${mongoConfig.endpoint}|${mongoConfig.database}|${mongoConfig.user}`;
+  }
+
+  // ════════════════════════════════════════════════════════
+  // Internal — Postgres Store
+  // ════════════════════════════════════════════════════════
+
+  private createPostgresStore(instanceId: string): PooledStore {
+    const { store } = createPostgresStoreForInstance(this.memoryCfg, instanceId, this.logger as StoreLogger);
+    return {
+      store,
+      embedding: createPostgresEmbeddingService(this.memoryCfg.embedding, this.logger as StoreLogger),
+      bm25Encoder: this.sharedBm25Encoder,
+    };
+  }
+
+  private postgresSchema(instanceId: string): string {
+    return schemaForInstance(resolvePostgresStoreConfig(this.memoryCfg.postgres).schema, instanceId);
+  }
+
+  private computePostgresFingerprint(instanceId: string): string {
+    const { url } = resolvePostgresStoreConfig(this.memoryCfg.postgres);
+    return `postgres:${url}|${this.postgresSchema(instanceId)}`;
   }
 
   // ════════════════════════════════════════════════════════
