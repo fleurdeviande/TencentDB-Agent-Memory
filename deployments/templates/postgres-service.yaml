@@ -1,0 +1,37 @@
+{{- if .Values.postgres.enabled }}
+# Headless: stable pod DNS for the StatefulSet.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agent-memory.postgres.name" . }}-headless
+  labels:
+    {{- include "agent-memory.postgres.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "agent-memory.postgres.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+---
+# What core/knowledge connect to.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agent-memory.postgres.name" . }}
+  labels:
+    {{- include "agent-memory.postgres.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "agent-memory.postgres.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+{{- end }}

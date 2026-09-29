@@ -1,0 +1,311 @@
+---
+# agent-memory: MemoryCore gateway (`core`) + MemoryKnowledge (`knowledge`) + PostgreSQL/pgvector.
+# `core` and `knowledge` are two aliases of shared-chart-app v1.7.0 running the SAME image
+# (global.image.* is injected at deploy time and shared by every alias); the role is picked by args.
+# `postgres` is rendered by this chart's own templates/.
+#
+# Secrets: OpenBao team-secrets/devops/agent-memory (store openbao-backend), keys
+#   postgres_password, tdai_gateway_api_key, knowledge_service_key, knowledge_secret_key.
+# Postgres password reaches the apps as PGPASSWORD (node-postgres reads it when the URL carries none),
+# so the URLs below hold no secret and need no URL-encoding.
+
+postgres:
+  enabled: true
+  # Referenced literally by POSTGRES_URL / KNOWLEDGE_DB_URL below — rename all three together.
+  name: agent-memory-postgres
+  image:
+    repository: pgvector/pgvector
+    tag: pg17
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  user: tdai
+  database: tdai
+  password:
+    secretStore: openbao-backend
+    openbaoSecretPath: team-secrets/devops/agent-memory
+    openbaoSecretKey: postgres_password
+  storage:
+    storageClass: rbd
+    size: 20Gi
+  shmSize: 256Mi
+  args: []
+  terminationGracePeriodSeconds: 60
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2048Mi
+  nodeSelector: {}
+  tolerations: []
+
+core:
+  enabled: true
+  fullnameOverride: agent-memory-core
+
+  args:
+    - core
+
+  service:
+    type: ClusterIP
+    ports:
+      - name: http
+        protocol: TCP
+        port: 8420
+
+  # Mounts global.appConfig.raw (bottom of this file) as /etc/tdai/config.yaml.
+  appConfig:
+    enabled: true
+    mountPath: /etc/tdai
+
+  podSecurityContext:
+    fsGroup: 1000
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+  env:
+    tdai_gateway_config: /etc/tdai/config.yaml
+    store_mode: postgres
+    postgres_url: postgres://tdai@agent-memory-postgres:5432/tdai
+    # L0-L3 routes require a personal sk-mem-… key; the shared key keeps management routes only.
+    tdai_gateway_shared_key_mode: "off"
+    # postgres mode writes nothing durable here (rowfs + pgfs); the paths just have to exist.
+    tdai_data_dir: /data/tdai-memory
+    log_path: /data/log
+    tdai_llm_base_url: http://r4-ai-01.r4h.nue:30001/v1
+    tdai_llm_api_key: EMPTY
+    tdai_llm_model: glm-5.3-flash
+    tdai_embedding_base_url: https://ollama.corp.pushwoosh.com/v1
+    tdai_embedding_api_key: ollama
+    tdai_embedding_model: embeddinggemma:latest
+    node_options: --max-old-space-size=1536
+
+  envOpenbaoSecrets:
+    - variableName: pgpassword
+      openbaoSecretPath: team-secrets/devops/agent-memory
+      openbaoSecretKey: postgres_password
+    - variableName: tdai_gateway_api_key
+      openbaoSecretPath: team-secrets/devops/agent-memory
+      openbaoSecretKey: tdai_gateway_api_key
+
+  extraVolumes:
+    - name: data
+      emptyDir: {}
+  extraVolumeMounts:
+    - name: data
+      mountPath: /data
+
+  livenessProbe:
+    enabled: true
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 20
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 6
+  readinessProbe:
+    enabled: true
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  # Graceful stop: lets in-flight L1/L2 pipeline tasks release their Postgres locks.
+  terminationGracePeriodSeconds: 60
+
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+      nginx.ingress.kubernetes.io/proxy-body-size: "25m"
+    hosts:
+      - host: memory.svc-nue.pushwoosh.com
+        paths:
+          - path: /
+            pathType: Prefix
+            servicePort: http
+    tls:
+      - secretName: pushwoosh-com-acme-tls
+        hosts:
+          - memory.svc-nue.pushwoosh.com
+
+knowledge:
+  enabled: true
+  fullnameOverride: agent-memory-knowledge
+
+  args:
+    - knowledge
+
+  service:
+    type: ClusterIP
+    ports:
+      - name: http
+        protocol: TCP
+        port: 8424
+
+  podSecurityContext:
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+  env:
+    port: "8424"
+    knowledge_db_url: postgres://tdai@agent-memory-postgres:5432/tdai_knowledge
+    knowledge_data_dir: /data/knowledge
+    # Unused with KNOWLEDGE_DB_URL; pinned onto the PVC in case the SQLite path is ever taken.
+    knowledge_db_path: /data/knowledge/knowledge.db
+    knowledge_public_base_url: https://memory-knowledge.svc-nue.pushwoosh.com/v3
+    # Private git hosts are SSRF-blocked unless listed here.
+    knowledge_git_allowed_hosts: gitlab.corp.pushwoosh.com
+    llm_mode: custom
+    llm_base_url: http://r4-ai-01.r4h.nue:30001/v1
+    llm_api_key: EMPTY
+    llm_model: glm-5.3-flash
+    llm_max_tokens: "16384"
+    llm_timeout_ms: "300000"
+    log_level: info
+
+  envOpenbaoSecrets:
+    - variableName: pgpassword
+      openbaoSecretPath: team-secrets/devops/agent-memory
+      openbaoSecretKey: postgres_password
+    - variableName: knowledge_service_key
+      openbaoSecretPath: team-secrets/devops/agent-memory
+      openbaoSecretKey: knowledge_service_key
+    - variableName: knowledge_secret_key
+      openbaoSecretPath: team-secrets/devops/agent-memory
+      openbaoSecretKey: knowledge_secret_key
+
+  # The only on-disk state by design: Code-Graph checkouts + codegraph indexes (rebuildable from git).
+  persistentVolumeClaim:
+    enabled: true
+    name: codegraph
+    storageClass: rbd
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+    mountPath: /data/knowledge
+
+  # RWO volume + RollingUpdate: the new pod must land on the old pod's node or it hangs on Multi-Attach.
+  # Required self-affinity does that (a pod matching its own term may schedule when no peer exists).
+  affinity: |
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              {{- include "shared-chart-app.selectorLabels" . | nindent 10 }}
+          topologyKey: kubernetes.io/hostname
+
+  livenessProbe:
+    enabled: true
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 20
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 6
+  readinessProbe:
+    enabled: true
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  terminationGracePeriodSeconds: 60
+
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      # Wiki ingest and code-graph builds are long LLM/git calls.
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+      nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    hosts:
+      - host: memory-knowledge.svc-nue.pushwoosh.com
+        paths:
+          - path: /
+            pathType: Prefix
+            servicePort: http
+    tls:
+      - secretName: pushwoosh-com-acme-tls
+        hosts:
+          - memory-knowledge.svc-nue.pushwoosh.com
+
+# MemoryCore gateway config as plain text (shared-chart-app >= v1.7.0 reads `raw`; only `core`
+# enables appConfig, so `knowledge` ignores it). Source: deploy/pw/tdai-gateway.pw.yaml, host 0.0.0.0.
+# ${...} are expanded by the gateway from the pod env above.
+global:
+  appConfig:
+    raw: |
+      deployMode: standalone
+      server:
+        port: 8420
+        host: "0.0.0.0"
+      data:
+        baseDir: "${TDAI_DATA_DIR}"
+      llm:
+        baseUrl: "${TDAI_LLM_BASE_URL}"
+        apiKey: "${TDAI_LLM_API_KEY}"
+        model: "${TDAI_LLM_MODEL}"
+        # GLM-5.3-Flash reasons before answering; the chat template defaults to effort=max, so leave room.
+        maxTokens: 16384
+        timeoutMs: 300000
+      memory:
+        capture:
+          enabled: true
+        extraction:
+          enabled: true
+          enableDedup: true
+          maxMemoriesPerSession: 20
+        persona:
+          triggerEveryN: 50
+          maxScenes: 15
+        pipeline:
+          everyNConversations: 5
+          enableWarmup: true
+          l1IdleTimeoutSeconds: 600
+          l2DelayAfterL1Seconds: 90
+          l2MinIntervalSeconds: 900
+          l2MaxIntervalSeconds: 3600
+        recall:
+          enabled: true
+          maxResults: 5
+          scoreThreshold: 0.3
+          strategy: "hybrid"
+          timeoutMs: 5000
+        storeBackend: "postgres"
+        embedding:
+          provider: "openai"
+          baseUrl: "${TDAI_EMBEDDING_BASE_URL}"
+          apiKey: "${TDAI_EMBEDDING_API_KEY}"
+          model: "${TDAI_EMBEDDING_MODEL}"
+          dimensions: 768
+          sendDimensions: false
+          maxInputTokens: 1800   # embeddinggemma context is 2048 tokens
+        bm25:
+          enabled: true
+          language: "zh"

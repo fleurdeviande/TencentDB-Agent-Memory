@@ -1,0 +1,36 @@
+---
+# Production (NUE, namespace devops).
+# One replica each: knowledge holds an RWO PVC; core keeps no local state (rowfs + pgfs + postgres
+# state backend) but multi-replica is unverified — scale only after a test. No PDB: with 1 replica
+# minAvailable 1 would block every node drain.
+
+postgres:
+  storage:
+    size: 20Gi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1024Mi
+    limits:
+      memory: 4096Mi
+
+core:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2048Mi
+
+knowledge:
+  replicaCount: 1
+  persistentVolumeClaim:
+    size: 20Gi
+  # Code-Graph builds (git clone + indexing) are the memory peaks.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 4096Mi

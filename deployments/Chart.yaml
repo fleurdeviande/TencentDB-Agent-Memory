@@ -1,0 +1,21 @@
+---
+apiVersion: v2
+name: agent-memory
+description: TencentDB-Agent-Memory (pw fork) — MemoryCore gateway + MemoryKnowledge on PostgreSQL/pgvector
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+dependencies:
+  # One image, two roles: both aliases take global.image.* and differ only in args/env.
+  # Same subchart version on both aliases, or `helm package` ships one of them (gitlab-ci-commons gate).
+  # oci:// resolves the version as an exact tag — the `v` prefix stays. v1.7.0 reads global.appConfig.raw.
+  - name: shared-chart-app
+    version: "v1.7.0"
+    repository: "oci://perl-harbor.svc-nue.pushwoosh.com/pw-charts"
+    alias: core
+    condition: core.enabled
+  - name: shared-chart-app
+    version: "v1.7.0"
+    repository: "oci://perl-harbor.svc-nue.pushwoosh.com/pw-charts"
+    alias: knowledge
+    condition: knowledge.enabled

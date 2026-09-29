@@ -1,0 +1,12 @@
+# Patterns to ignore when building packages.
+# NB: do NOT ignore charts/, Chart.lock or *.tgz — helm package must include the
+# downloaded subchart (shared-chart-app) or dependency resolution fails.
+.DS_Store
+.git/
+.gitignore
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.idea/
