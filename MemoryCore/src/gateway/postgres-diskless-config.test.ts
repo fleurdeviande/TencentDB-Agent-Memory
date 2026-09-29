@@ -7,9 +7,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { loadGatewayConfig, resolveL0JsonlMirror, usesLocalDataDir } from "./config.js";
+import { loadGatewayConfig, resolveL0JsonlMirror, resolveStateBackend, usesLocalDataDir } from "./config.js";
 
 const dirs: string[] = [];
+const ENV_KEYS = ["STORE_MODE", "FILE_STORE_MODE", "FILE_STORE_OTHERS", "TDAI_L0_JSONL_MIRROR", "STATE_BACKEND"];
 
 function load(env: Record<string, string>, yaml = "deployMode: standalone\nmemory:\n  storeBackend: sqlite\n") {
   const dir = mkdtempSync(path.join(tmpdir(), "gw-cfg-"));
@@ -18,10 +19,10 @@ function load(env: Record<string, string>, yaml = "deployMode: standalone\nmemor
   writeFileSync(file, yaml);
   vi.stubEnv("TDAI_GATEWAY_CONFIG", file);
   vi.stubEnv("TDAI_DATA_DIR", dir);
-  for (const k of ["STORE_MODE", "FILE_STORE_MODE", "FILE_STORE_OTHERS", "TDAI_L0_JSONL_MIRROR"]) vi.stubEnv(k, "");
+  for (const k of ENV_KEYS) vi.stubEnv(k, "");
   for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
   // vi.stubEnv("", …) leaves an empty string; the config treats unset only as undefined.
-  for (const k of ["STORE_MODE", "FILE_STORE_MODE", "FILE_STORE_OTHERS", "TDAI_L0_JSONL_MIRROR"]) {
+  for (const k of ENV_KEYS) {
     if (process.env[k] === "") delete process.env[k];
   }
   return loadGatewayConfig();
@@ -38,6 +39,8 @@ describe("diskless postgres gateway config", () => {
     expect(cfg.memory.storeBackend).toBe("postgres");
     expect(cfg.memory.capture.l0JsonlMirror).toBe(false);
     expect(usesLocalDataDir(cfg.data, "postgres")).toBe(false);
+    // The standalone yaml says stateBackend: local; STORE_MODE=postgres lifts it.
+    expect(load({ STORE_MODE: "postgres" }, 'deployMode: standalone\nstateBackend: "local"\n').stateBackend).toBe("postgres");
   });
 
   it("each part stays overridable", () => {
@@ -57,7 +60,18 @@ describe("diskless postgres gateway config", () => {
     const cfg = load({});
     expect(cfg.data).toMatchObject({ fileStore: "local", fileStoreOthers: "local", l0JsonlMirror: true });
     expect(cfg.memory.storeBackend).toBe("sqlite");
+    expect(cfg.stateBackend).toBeUndefined();
     expect(usesLocalDataDir(cfg.data, undefined)).toBe(true);
+  });
+
+  it("resolveStateBackend: env wins, STORE_MODE=postgres lifts unset/local, explicit redis stays", () => {
+    expect(resolveStateBackend(undefined, undefined, "postgres")).toBe("postgres");
+    expect(resolveStateBackend(undefined, "local", "postgres")).toBe("postgres");
+    expect(resolveStateBackend(undefined, "redis", "postgres")).toBe("redis");
+    expect(resolveStateBackend("local", undefined, "postgres")).toBe("local");
+    expect(resolveStateBackend(undefined, "local", "sqlite")).toBe("local");
+    expect(resolveStateBackend(undefined, undefined, undefined)).toBeUndefined();
+    expect(resolveStateBackend("bogus", undefined, undefined)).toBeUndefined();
   });
 
   it("resolveL0JsonlMirror parses on/off and rejects anything else", () => {

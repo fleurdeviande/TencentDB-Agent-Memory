@@ -375,8 +375,12 @@ export interface GatewayConfig {
 
   // ── Service-mode config (also settable via env vars, env takes priority) ──
 
-  /** State backend type. env: STATE_BACKEND. yaml: stateBackend */
-  stateBackend?: "redis" | "local";
+  /**
+   * State backend type. env: STATE_BACKEND. yaml: stateBackend. With
+   * STORE_MODE=postgres an unset or yaml "local" value becomes "postgres"
+   * (pipeline state survives restarts); env STATE_BACKEND=local still wins.
+   */
+  stateBackend?: "redis" | "local" | "postgres";
   /** Default instance ID for standalone pipeline. env: TDAI_INSTANCE_ID. yaml: instanceId */
   instanceId: string;
   redis: RedisConfig;
@@ -520,6 +524,26 @@ export function resolveFileStoreOthersMode(
   throw new Error(
     `invalid FILE_STORE_OTHERS/data.fileStoreOthers: ${JSON.stringify(raw)} (expected "local" | "cos" | "mongofs" | "pgfs")`,
   );
+}
+
+/**
+ * Resolve the pipeline state backend: env `STATE_BACKEND` > STORE_MODE=postgres
+ * (which lifts an unset or yaml "local" to "postgres") > yaml `stateBackend` >
+ * undefined (the gateway then picks by deploy mode: local / redis). Unknown
+ * values stay undefined, as upstream treated them.
+ */
+export function resolveStateBackend(
+  envValue: string | undefined,
+  yamlValue: string | undefined,
+  storeMode?: string,
+): GatewayConfig["stateBackend"] {
+  const known = (v: string | undefined) =>
+    v === "redis" || v === "local" || v === "postgres" ? v : undefined;
+  const fromEnv = known(envValue);
+  if (fromEnv) return fromEnv;
+  const fromYaml = known(yamlValue);
+  if (storeMode === "postgres" && (fromYaml === undefined || fromYaml === "local")) return "postgres";
+  return fromYaml;
 }
 
 /**
@@ -777,8 +801,7 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
   );
 
   // State backend (env > yaml > auto from deployMode)
-  const rawBackend = env("STATE_BACKEND") ?? str(fileConfig, "stateBackend");
-  const stateBackend = rawBackend === "redis" || rawBackend === "local" ? rawBackend : undefined;
+  const stateBackend = resolveStateBackend(env("STATE_BACKEND"), str(fileConfig, "stateBackend"), env("STORE_MODE"));
 
   // Instance ID: service mode requires explicit instanceId from request headers (x-tdai-service-id),
   // standalone mode uses configured or defaults to "default".

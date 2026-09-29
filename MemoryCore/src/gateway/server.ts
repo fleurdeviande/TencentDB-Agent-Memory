@@ -1908,7 +1908,7 @@ export class TdaiGateway {
    *   - service    → remote backend (default)
    *
    * env vars:
-   *   STATE_BACKEND=local|remote  — backend type
+   *   STATE_BACKEND=local|remote|postgres  — backend type (postgres: default with STORE_MODE=postgres)
    *   SCANNER_INSTANCES=inst1,inst2 — instances to scan (default: "default")
    *   SCANNER_INTERVAL_MS=500 — scan interval
    *   WORKER_POLL_MS=200 — worker poll interval
@@ -1917,7 +1917,7 @@ export class TdaiGateway {
     // Determine backend type from config (env > yaml > auto from deployMode):
     //   - "standalone" → local (in-process Map/setTimeout, zero dependencies)
     //   - "service"    → remote state backend
-    const backendType: "redis" | "local" =
+    const backendType: "redis" | "local" | "postgres" =
       this.config.stateBackend ?? (this.config.deployMode === "service" ? "redis" : "local");
 
     this.logger.info(`Starting integrated services (deployMode=${this.config.deployMode}, state_backend=${backendType})...`);
@@ -2004,6 +2004,11 @@ export class TdaiGateway {
         ["db", this.config.redis.db],
         ["keyPrefix", this.config.redis.keyPrefix],
       ]) : undefined,
+      // One schema for the whole deployment: TDAI_STATE_POSTGRES_SCHEMA, else the base POSTGRES_SCHEMA.
+      postgres: backendType === "postgres" ? {
+        url: resolvePostgresStoreConfig(this.config.memory.postgres).url,
+        schema: process.env.TDAI_STATE_POSTGRES_SCHEMA || resolvePostgresStoreConfig(this.config.memory.postgres).schema,
+      } : undefined,
     });
     this.logger.info(`State Backend created (${backendType})`);
 
