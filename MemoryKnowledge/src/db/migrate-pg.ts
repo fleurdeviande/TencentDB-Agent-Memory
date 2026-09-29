@@ -155,12 +155,14 @@ const DDL = `
     snippet     TEXT,
     title_tok   TEXT NOT NULL DEFAULT '',
     content_tok TEXT NOT NULL DEFAULT '',
+    tok_count   INTEGER NOT NULL DEFAULT 0,
     fts         TSVECTOR GENERATED ALWAYS AS (
                   setweight(to_tsvector('simple'::regconfig, title_tok), 'A') ||
                   setweight(to_tsvector('simple'::regconfig, content_tok), 'D')
                 ) STORED,
     PRIMARY KEY (wiki_id, page_id)
   );
+  ALTER TABLE knowledge_wiki_page ADD COLUMN IF NOT EXISTS tok_count INTEGER NOT NULL DEFAULT 0;
   CREATE INDEX IF NOT EXISTS idx_kwp_fts ON knowledge_wiki_page USING GIN (fts);
 
   CREATE TABLE IF NOT EXISTS knowledge_wiki_edge (
