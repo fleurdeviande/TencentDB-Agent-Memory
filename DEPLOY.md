@@ -1,7 +1,7 @@
 # agent-memory on NUE (namespace `devops`)
 
 The pw fork deployed the org way: GitLab CI (`gitlab-ci-commons` `/main-argo.yml`) builds the root
-`Dockerfile`, packages `deployments/` and promotes through `Pushwoosh/deployments-state` to ArgoCD.
+`Dockerfile`, packages `deployments/` and promotes through `Pushwoosh/deployments-state` to ArgoCD (two Applications, see below).
 
 ## What gets deployed
 
@@ -37,77 +37,37 @@ KV-v2 mount `team-secrets`, path `team-secrets/devops/agent-memory`, store `open
 The apps get the password as `PGPASSWORD` (node-postgres uses it when the URL has none), so the
 connection URLs in values carry no secret.
 
-## deployments-state (one MR, before the first tag)
+## deployments-state: two Applications
 
-`bootstrap/clusters/nue/devops/agent-memory.yaml`:
+No single AppProject allows the whole release — `services` has no StatefulSet, `stateful` has no
+Ingress / ExternalSecret — so NUE runs it as two Applications from the same chart and tag
+(onboarded in Pushwoosh/deployments-state!387):
 
-```yaml
----
-# agent-memory — multi-source: chart from the OCI mirror, values read directly from the
-# application's own git repository, both pinned to the same release tag.
-# global.appConfig.raw (gateway config) lives in deployments/values.yaml, so $values carries it.
-# The three parameters stay mandatory: packaged values omit global.image.* and global.environment.
-# targetRevision, the $values revision and global.image.tag are one version, bumped together.
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: agent-memory
-  namespace: devops
-  labels:
-    cluster: nue
-    ns: devops
-spec:
-  project: services
-  sources:
-    - repoURL: perl-harbor.svc-nue.pushwoosh.com/pw-charts
-      chart: agent-memory
-      targetRevision: &tag v0.1.0
-      helm:
-        releaseName: agent-memory
-        valueFiles:
-          - $values/deployments/values.yaml
-          - $values/deployments/values.prod.yaml
-        parameters:
-          - name: global.environment
-            value: prod
-          - name: global.image.repository
-            value: registry-auth.corp.pushwoosh.com/devops/agent-memory
-          - name: global.image.tag
-            value: *tag
-    - repoURL: https://gitlab.corp.pushwoosh.com/DevOps/agent-memory.git
-      targetRevision: *tag
-      ref: values
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: devops
-  syncPolicy:
-    automated:
-      prune: false
-      selfHeal: false
-```
+| file | project | values | contents | sync |
+|---|---|---|---|---|
+| `bootstrap/clusters/nue/devops/agent-memory.yaml` | `services` | `values.apps-only.yaml` | core, knowledge, Ingresses, ExternalSecrets incl. the `agent-memory-postgres` password Secret | automated (prune/selfHeal off); promote target |
+| `bootstrap/clusters/nue/devops/agent-memory-postgres.yaml` | `stateful` | `values.postgres-only.yaml` | PostgreSQL StatefulSet, Services, init ConfigMap | **manual**, like mongo.yaml; `ignoreDifferences` on `volumeClaimTemplates` + PVC size; not in the promote allowlist |
 
-`ci/promote_allowlist.yaml`:
-
-```yaml
-DevOps/agent-memory:
-  prod: bootstrap/clusters/nue/devops/agent-memory.yaml
-```
-
-`v0.1.0` stands for the first tag. Argo syncs the file as soon as it is merged, so merge it once that
-tag's `Helm Package | Production` has published the chart (earlier = a ComparisonError until it exists).
-The promote job refuses a project without the file; if it ran before the merge, retry it — with the tag
-already in the file it only waits for convergence. Later tags are bumped by the promote job itself.
+Resource names are literal (`postgres.name`), so the two releases reach each other regardless of the
+release names. `ci/promote_allowlist.yaml` maps `DevOps/agent-memory` → `agent-memory.yaml` only.
 
 ## Release
 
 1. OpenBao keys exist.
-2. Push a SemVer tag `vX.Y.Z` on `DevOps/agent-memory` → Docker Build + Helm Package, then `Promote | NUE`
-   (first release: merge the deployments-state MR in between, see above).
-3. Check: `kubectl -n devops get pods -l 'app in (agent-memory-core,agent-memory-knowledge,agent-memory-postgres)'`,
+2. Push a SemVer tag `vX.Y.Z` on `DevOps/agent-memory` → Docker Build + Helm Package, then `Promote | NUE`,
+   which bumps and syncs `agent-memory.yaml`.
+3. Database changes (chart templates or `postgres.*` values): bump the three versions in
+   `agent-memory-postgres.yaml` in a reviewed deployments-state MR, then sync it by hand in ArgoCD.
+4. Check: `kubectl -n devops get pods -l 'app in (agent-memory-core,agent-memory-knowledge,agent-memory-postgres)'`,
    `curl -fsS https://memory.svc-nue.pushwoosh.com/health`, same for `memory-knowledge`.
 
+First install (v0.1.1): merge !387 after the tag's Helm Package, re-run `Promote | NUE` (syncs
+`agent-memory`; its ExternalSecret creates the password Secret; core/knowledge cannot reach the database
+yet — expected), then sync `agent-memory-postgres` by hand; core/knowledge reconnect.
+
 Rollback: revert the promote commit in deployments-state (promoting an older tag is refused as
-superseded). Postgres data survives: `prune: false`, and StatefulSet PVCs are never deleted by helm.
+superseded). Postgres data survives: the database Application never auto-syncs, and StatefulSet PVCs
+are never deleted by helm.
 
 ## First user key
 
