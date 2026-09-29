@@ -22,7 +22,7 @@ import zlib from "node:zlib";
 import dayjs from "dayjs";
 import { TdaiCore } from "../core/tdai-core.js";
 import { StandaloneHostAdapter } from "../adapters/standalone/host-adapter.js";
-import { loadGatewayConfig, parseBrokers } from "./config.js";
+import { loadGatewayConfig, parseBrokers, usesLocalDataDir } from "./config.js";
 import type { GatewayConfig, GatewayConfigOverrides } from "./config.js";
 import { dbChoiceToStoreConfigs, LocalBackendResolver } from "../core/backend-selection/index.js";
 import type { BackendResolver } from "../core/backend-selection/index.js";
@@ -400,6 +400,9 @@ export class TdaiGateway {
       hostAdapter: adapter,
       config: this.config.memory,
       sessionFilter: new SessionFilter(this.config.memory.capture.excludeAgents),
+      // Diskless (postgres + rowfs + pgfs): the core gets its storage later
+      // (setStorage) and must not lay out a data dir in the meantime.
+      localDataDir: usesLocalDataDir(this.config.data),
       skillAssetHooks: {
         // v1 首创前置 await：抛异常 = create 失败（避免「skill 已落库但 asset
         // 缺失」的静默不一致）。standalone 模式下唯一的登记入口除了 handler 层的
@@ -544,7 +547,7 @@ export class TdaiGateway {
    */
   async start(): Promise<void> {
     // Initialize data directories
-    initDataDirectories(this.config.data.baseDir);
+    if (usesLocalDataDir(this.config.data)) initDataDirectories(this.config.data.baseDir);
 
     applyMetadataEnvFromGatewayConfig(this.config.metadata);
 
@@ -1024,6 +1027,7 @@ export class TdaiGateway {
         getEmbedding: () => this.core.getEmbeddingService(),
         getStorage: () => this.core.getStorage(),
         deployMode: this.config.deployMode,
+        l0JsonlMirror: this.config.data.l0JsonlMirror,
         // Inject pipeline introspection deps for /v2/pipeline/status (standalone-only).
         // Both can be undefined in legacy standalone (no stateBackend configured) —
         // the handler returns 503 in that case.

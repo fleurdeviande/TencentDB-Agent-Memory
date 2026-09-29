@@ -31,6 +31,13 @@ export interface CaptureConfig {
    * Default false: when disabled, non-zero retention must be >= 3.
    */
   allowAggressiveCleanup: boolean;
+
+  /**
+   * Write captured L0 to `conversations/<date>.jsonl` as well as the store.
+   * Unset = on (upstream). The gateway turns it off for STORE_MODE=postgres;
+   * without a usable store the JSONL is still written (it is L1's fallback input).
+   */
+  l0JsonlMirror?: boolean;
 }
 
 /** Extraction settings (L1) — controls memory extraction from conversations. */

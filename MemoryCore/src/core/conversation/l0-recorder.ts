@@ -112,6 +112,8 @@ export async function recordConversation(params: {
   originalUserMessageCount?: number;
   /** StorageAdapter for file operations (COS/local). Falls back to fs when absent. */
   storage?: StorageAdapter;
+  /** Write the JSONL shard (default true); false returns the filtered messages only. */
+  writeJsonl?: boolean;
 }): Promise<ConversationMessage[]> {
   const { sessionKey, sessionId, userId, agentId, rawMessages, baseDir, logger, originalUserText, afterTimestamp, originalUserMessageCount, storage } = params;
 
@@ -269,6 +271,11 @@ export async function recordConversation(params: {
   if (filtered.length === 0) {
     logger?.debug?.(`${TAG} All messages filtered out, skipping L0 write`);
     return [];
+  }
+
+  if (params.writeJsonl === false) {
+    logger?.debug?.(`${TAG} L0 JSONL mirror off, ${filtered.length} messages go to the store only`);
+    return filtered;
   }
 
   // Step 4: Write to JSONL file — one message per line (flat format)

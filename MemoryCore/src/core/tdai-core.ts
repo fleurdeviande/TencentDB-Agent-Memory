@@ -140,6 +140,12 @@ export interface TdaiCoreOptions {
    * （零耦合：OpenClaw 无 MetadataService 场景仍可安全构造）。
    */
   skillAssetHooks?: SkillAssetHooks;
+  /**
+   * `false`: the host keeps the whole file plane off disk (the gateway with
+   * STORE_MODE=postgres, rowfs + pgfs), so the core creates no data-dir
+   * skeleton and writes no `.metadata/manifest.json`. Default true (upstream).
+   */
+  localDataDir?: boolean;
 }
 
 // ============================
@@ -223,6 +229,7 @@ export class TdaiCore {
    * of currently-running background tasks.
    */
   private readonly bgTasks = new Set<Promise<void>>();
+  private readonly localDataDir: boolean;
 
   constructor(opts: TdaiCoreOptions) {
     this.hostAdapter = opts.hostAdapter;
@@ -234,6 +241,7 @@ export class TdaiCore {
     this.instanceId = opts.instanceId;
     this.storage = opts.storage;
     this.skillAssetHooks = opts.skillAssetHooks;
+    this.localDataDir = opts.localDataDir !== false;
   }
 
   // ============================
@@ -246,7 +254,7 @@ export class TdaiCore {
    */
   async initialize(): Promise<void> {
     this.logger.debug?.(`${TAG} Initializing TDAI Core: dataDir=${this.dataDir}`);
-    initDataDirectories(this.dataDir);
+    if (this.localDataDir) initDataDirectories(this.dataDir);
 
     // Initialize stores (async)
     this.storeReady = this.initStores();
@@ -612,7 +620,7 @@ export class TdaiCore {
 
   private async initStores(): Promise<void> {
     try {
-      const stores = await initStores(this.cfg, this.dataDir, this.logger);
+      const stores = await initStores(this.cfg, this.dataDir, this.logger, { writeManifest: this.localDataDir });
       this.vectorStore = stores.vectorStore;
       this.embeddingService = stores.embeddingService;
       this.logger.debug?.(`${TAG} Stores initialized: backend=${this.cfg.storeBackend}, embedding=${this.cfg.embedding.provider}`);

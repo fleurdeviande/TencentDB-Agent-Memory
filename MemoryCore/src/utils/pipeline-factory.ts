@@ -290,6 +290,8 @@ export function initStores(
   cfg: MemoryTdaiConfig,
   pluginDataDir: string,
   logger: PipelineLogger,
+  /** `writeManifest: false` keeps `.metadata/manifest.json` off disk (diskless hosts). */
+  opts?: { writeManifest?: boolean },
 ): Promise<StoreInitResult> {
   const key = pluginDataDir;
   const cached = _storeInitCache.get(key);
@@ -302,10 +304,10 @@ export function initStores(
       logger.warn?.(
         `${TAG} Cached store for "${key}" is unusable (failed init or closed store) — re-initializing`,
       );
-      return initStores(cfg, pluginDataDir, logger);
+      return initStores(cfg, pluginDataDir, logger, opts);
     });
   }
-  const promise = _doInitStores(cfg, pluginDataDir, logger);
+  const promise = _doInitStores(cfg, pluginDataDir, logger, opts);
   _storeInitCache.set(key, promise);
   // A failed bundle is still delivered to current callers (unchanged failure
   // semantics), but it is evicted afterwards so the next call retries.
@@ -342,6 +344,7 @@ async function _doInitStores(
   cfg: MemoryTdaiConfig,
   pluginDataDir: string,
   logger: PipelineLogger,
+  opts?: { writeManifest?: boolean },
 ): Promise<StoreInitResult> {
   let vectorStore: IMemoryStore | undefined;
   let embeddingService: EmbeddingService | undefined;
@@ -369,7 +372,7 @@ async function _doInitStores(
       reindexReason = initResult.reason;
 
       // ── Manifest: first-write + config-drift detection ──
-      try {
+      if (opts?.writeManifest !== false) try {
         const currentStoreInfo = buildStoreInfo(bundle.storeSnapshot);
         const existing = readManifest(pluginDataDir);
 
