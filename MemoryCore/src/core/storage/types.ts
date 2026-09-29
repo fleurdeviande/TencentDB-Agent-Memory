@@ -103,8 +103,10 @@ export interface IStorageBackend {
    * `mongofs` is the general-purpose file backend over MongoDB documents
    * (MongoFSBackend): arbitrary keys chunked into the instance's own database,
    * used as the rowfs others leg in the TCS form (zero disk dependency).
+   * `pgfs` is the same idea over Postgres rows (PostgresFSBackend), the
+   * others leg for `STORE_MODE=postgres`.
    */
-  readonly type: "local" | "cos" | "rowfs" | "mongofs";
+  readonly type: "local" | "cos" | "rowfs" | "mongofs" | "pgfs";
 
   /**
    * Write an object (create or overwrite).
