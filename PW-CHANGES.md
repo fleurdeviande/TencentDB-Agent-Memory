@@ -68,8 +68,9 @@ Deviations and unsupported optional methods:
   `getVectorCoverage`, `getEmbeddingMigrationStatus`, `commitEmbeddingMigration`,
   `rollbackEmbeddingMigration` — the shadow reindex commits itself instead. `searchL1Hybrid`/`searchL0Hybrid`
   are absent (`nativeHybridSearch=false`, callers fuse client-side as with sqlite).
-- The store serves profile rows (`profileRows=true`), but `FILE_STORE_MODE=rowfs` is still restricted to
-  `db.kind="mongodb"` by `validateResolution`; L2/L3 sync to rows works through the regular profile-sync path.
+- The store serves profile rows (`profileRows=true`); since `pw/postgres-core-files` `FILE_STORE_MODE=rowfs` is
+  legal on postgres and is its default, with the rest of the file plane in `pgfs` (see "Diskless
+  `STORE_MODE=postgres`" below).
 - The metadata service (`meta_*`) follows `STORE_MODE=postgres` since `pw/postgres-metadata`, see below;
   MemoryKnowledge has its own Postgres dialect (`KNOWLEDGE_DB_URL`).
 
@@ -91,7 +92,7 @@ isolation holding across teams.
 
 | package | result |
 |---|---|
-| MemoryCore | vitest 27/27 upstream baseline; 93/93 with the postgres backend and contract runners; 244/244 with postgres metadata and personal keys |
+| MemoryCore | vitest 27/27 upstream baseline; 93/93 with the postgres backend and contract runners; 244/244 with postgres metadata and personal keys; 316/316 with the diskless file plane and pipeline state |
 | MemoryKnowledge | vitest 161/161 upstream baseline; 186 + 5 skipped on SQLite, 190 + 1 skipped on Postgres (wiki index included) |
 | MemoryCore/claude-code-plugin | tsc clean, vitest 17/17 |
 | pw/mcp | tsc clean, vitest 41/41, smoke OK (incl. a personal-key pass) |
@@ -426,6 +427,121 @@ Results (Node 22, pgvector/pgvector:pg17):
 | pw/mcp | tsc clean (exit 0), vitest 41/41 (exit 0), `npm run smoke` → SMOKE OK (exit 0) |
 
 Still not on PostgreSQL: code-graph index files (third-party `@colbymchenry/codegraph`, rebuildable from git);
-the file plane (`FILE_STORE_MODE=local`: L2/L3 markdown, checkpoints, `.metadata/*.json`, the standalone L0
-JSONL mirror) and `LocalStateBackend`'s pipeline state; MemoryProxy's own SQLite (the proxy is not used).
-SQLite stays the default for every store when `STORE_MODE` is not `postgres`.
+MemoryProxy's own SQLite (the proxy is not used). ~~The file plane and `LocalStateBackend`'s pipeline state~~ —
+moved in `pw/postgres-core-files`, see below. SQLite stays the default for every store when `STORE_MODE` is
+not `postgres`.
+
+## Diskless `STORE_MODE=postgres` (`pw/postgres-core-files`)
+
+Decision: with `STORE_MODE=postgres` nothing durable of MemoryCore lives on disk. Before this branch the gateway
+in that mode still wrote, into `TDAI_DATA_DIR`: a SQLite `vectors.db` (the core's own default store, from the
+yaml's `storeBackend: sqlite`), `.metadata/manifest.json`, `.metadata/checkpoint.json` (+ per-scope copies under
+`profiles/<scope>/`), `scene_blocks/*.md` + `persona.md` materialised from the rows, `conversations/*.jsonl`
+(L0 mirror), `records/*.jsonl` (L1 shards), generation logs, skill/offload files, and the empty skeleton
+`conversations/ records/ scene_blocks/ .metadata/ .backup/`; the pipeline queue, timers and counters lived in
+process memory (`LocalStateBackend`).
+
+### Inventory of the file plane and where it goes
+
+| artefact | writer | now |
+|---|---|---|
+| `scene_blocks/<name>.md`, `persona.md` (L2/L3) | L2/L3 runners, `/v3/scenario/*`, `/v3/core/*` | `profiles` rows via rowfs (`ProfileRowStorageBackend`) — already implemented by `PostgresMemoryStore` |
+| `.metadata/scene_index.json` | scene extractor | not written: rowfs derives the index from the L2 rows (upstream P2-D2) |
+| `.metadata/checkpoint.json`, `profiles/<scope>/.metadata/checkpoint.json` | `CheckpointManager` (L1 cursor, L2/L3 counters, persona trigger) | pgfs object, per profile domain (see scoping) |
+| `instances/<inst>/…` generation logs | `MemoryGenerationLogStore` | pgfs |
+| `records/<date>.jsonl` (L1 shards) | `l1-writer` | pgfs (append = one chunk row) |
+| `conversations/<date>.jsonl` (L0 mirror) | v2 `conversation/add`, v1 capture | off by default (below); pgfs when re-enabled |
+| skill resources, skill conversation buffers, offload artefacts | `SkillCore`, skill buffer storage, offload executors | pgfs (they already wrote through the core storage adapter) |
+| `.backup/…` | `BackupManager` | not used on the storage path (local-fs only, upstream) |
+| `.metadata/manifest.json` | `_doInitStores` (sync `fs`) | not written when diskless |
+| `vectors.db` | core `initStores` | not created: `STORE_MODE=postgres` sets `memory.storeBackend=postgres` |
+| data-dir skeleton | `initDataDirectories` (gateway start + core init) | skipped when diskless |
+
+### What changed
+
+- **`pgfs` — `PostgresFSBackend`** (`src/core/storage/postgres-fs-backend.ts`): a general `IStorageBackend` in the
+  instance schema, the Postgres counterpart of `mongofs`. Tables `fs_objects (key PK, size, next_seq, version,
+  content_type, metadata JSONB, updated_at_ms)` and `fs_chunks (key → fs_objects ON DELETE CASCADE, seq, data
+  BYTEA)`, component `files` in `schema_migrations`. put/append are one transaction each; the object row is
+  upserted first, so its row lock orders concurrent appends (the O_APPEND equivalent) and a put replaces the
+  chunks atomically (the tmp+rename equivalent); reads are one statement, i.e. one snapshot. 1 MiB chunks. Keys:
+  relative, no NUL, no `..` segment. String-prefix listing per the D9.2 contract.
+- **Selection**: `validateResolution` allows `profile=rows` for `postgres`; `FILE_STORE_OTHERS=pgfs` requires
+  `db.kind="postgres"`. With `STORE_MODE=postgres` the defaults are `FILE_STORE_MODE=rowfs`,
+  `FILE_STORE_OTHERS=pgfs`; explicit values win (`FILE_STORE_MODE=local` restores the disk layout,
+  `FILE_STORE_OTHERS=local` keeps rows for L2/L3 but files for the rest).
+- **Per-domain others leg** (`CompositeStorageBackend` option `scopeOthers`, set by the gateway for postgres only):
+  upstream rowfs passes the others leg through unscoped, so all teams would share one `.metadata/checkpoint.json`
+  — L2 counters and the L3 persona trigger mixed across teams, and L3 would never discover a scope (it lists
+  `profiles/`) and fall back to the global view. Rebinding a view to a domain now also prefixes the others leg
+  with `profiles/{scope}/`, the layout local/COS mode use. L3's scoped view passes that prefix too
+  (`scopedStorageForScope`); composites without `scopeOthers` ignore it, so mongodb rowfs is unchanged.
+- **L0 JSONL mirror off by default** (`TDAI_L0_JSONL_MIRROR`): the mirror is an audit copy next to the store;
+  L1 reads `l0_conversations` and falls back to the JSONL only when the store is unusable. In postgres mode the
+  mirror would be a second copy of every message in the same database, append-only and never pruned (the
+  memory cleaner only walks a local dir). The v1 capture path honours the switch through
+  `memory.capture.l0JsonlMirror` but still writes while no usable store holds L0.
+- **Core**: `STORE_MODE=postgres` sets `memory.storeBackend=postgres` (the core's own store for v1 routes), and
+  `usesLocalDataDir()` (postgres + rowfs + pgfs) makes the gateway and `TdaiCore` (`localDataDir: false`) skip
+  the data-dir skeleton and the manifest.
+- **`PostgresStateBackend`** (`src/core/state/postgres-backend.ts`, component `state`): `pipeline_sessions`
+  (counters as JSONB, patched with `||`), `pipeline_buffers`, `pipeline_timers`, `pipeline_tasks` (owner NULL =
+  queued, else pending) and `pipeline_locks` (lease with expiry). Claims are `FOR UPDATE SKIP LOCKED`;
+  `captureAtomic` is one transaction on the locked session row (count → enqueue → timer); `replacePendingTask`
+  deletes and enqueues in one transaction. Consumed tasks stay pending until ACKed and `claimStaleTasks` hands
+  a dead worker's claims to a live one, so a crash no longer loses in-flight or queued work. Timers fire
+  through `TimerScanner.claimExpiredFromShard` (one shard) instead of `setTimeout`. Blocking consumes poll
+  (≤ 200 ms) and are woken at once by in-process enqueues.
+- `deploy/global-images/start-memory-core.sh` passes `FILE_STORE_MODE`, `FILE_STORE_OTHERS`, `STATE_BACKEND`,
+  `TDAI_STATE_POSTGRES_SCHEMA`, `TDAI_L0_JSONL_MIRROR` through when set; its generated yaml says
+  `stateBackend: local`, which `STORE_MODE=postgres` lifts to postgres.
+
+### Configuration
+
+| key | default | meaning |
+|---|---|---|
+| `FILE_STORE_MODE` / `data.fileStore` | `rowfs` with `STORE_MODE=postgres`, else upstream (`local` / `cos`) | `local` keeps the whole file plane on disk |
+| `FILE_STORE_OTHERS` / `data.fileStoreOthers` | `pgfs` with `STORE_MODE=postgres`, else upstream | now also `pgfs` (postgres only) |
+| `TDAI_L0_JSONL_MIRROR` / `data.l0JsonlMirror` | `off` with `STORE_MODE=postgres`, else `on` | `on`/`off` (`true`/`false`/`1`/`0`); invalid → boot fails |
+| `STATE_BACKEND` / `stateBackend` | `postgres` with `STORE_MODE=postgres` when env is unset and yaml says nothing or `local`; else upstream (`local` / `redis` by deploy mode) | now also `postgres`; env `STATE_BACKEND=local` keeps the in-memory backend |
+| `TDAI_STATE_POSTGRES_SCHEMA` | `POSTGRES_SCHEMA` (`tdai`) | schema of the `pipeline_*` tables, one per deployment (all instances) |
+
+pgfs objects live in each instance's schema (`POSTGRES_SCHEMA`, `<base>_i_<slug>_<hash>`), next to its memory rows.
+
+### What still touches the disk in postgres mode, and why
+
+- **Logs**: `core.log` / `observability.log` under `LOG_PATH` (default `/data/log/`, rotating, skipped when not
+  writable) plus stdout. Diagnostics, not state; point `LOG_PATH` elsewhere or leave it unwritable.
+- **The data dir itself**: `TDAI_DATA_DIR` is still resolved and may exist (the deploy script mounts a volume);
+  it stays empty. No lock file is written.
+- Not touched in this mode, listed for completeness: `.backup/` (BackupManager runs only without a storage
+  adapter), the sandboxed local LLM tools (used only without a storage adapter), OpenClaw's clean-context
+  workspace (plugin path, not the gateway), MemoryKnowledge's files (separate service).
+
+### Deviations and known limits
+
+- **L1 JSONL shards stay** (`records/<date>.jsonl`, now in pgfs): a second copy of `l1_records`, append-only; no
+  switch was added (not asked for). Each append is one chunk row, so a busy day's shard is many small rows.
+- **Crash recovery speed**: a claim is stale after `pendingStaleMs`, which the worker raises to at least
+  `lockTtlMs + 2 × 30 s` (the fixed lock-renew interval): ≥ 11 min with default settings, ~91 s with
+  `lockTtlMs: 31000`. Queued-but-unclaimed tasks are picked up at once. A graceful stop hands its claims back
+  immediately (upstream behaviour).
+- **Existing installs**: no copy of an existing data dir into pgfs or of in-memory state into Postgres; switching
+  starts with empty checkpoints (the L1 cursor restarts, so the first L1 run after the switch re-reads L0 from
+  the beginning of the store) — or set `FILE_STORE_MODE=local` to keep the old layout.
+- The standalone rowfs path logs `rowfs storage assembled` at info on every request (upstream; the composite is
+  deliberately not cached).
+- `closeSharedPostgresPools()` runs in `storePool.closeAll()` before `core.destroy()` at shutdown (upstream order);
+  nothing writes in between today.
+
+### Tests (Node 22, pgvector/pgvector:pg17)
+
+| suite | result |
+|---|---|
+| `postgres-fs-backend.test.ts` — D9.2 storage contract (its first runner) at the root and under a prefix, concurrent appends, chunking, metadata, key validation, schema isolation | 30/30 |
+| `rowfs-postgres.test.ts` — selection defaults/overrides, `validateResolution`, config resolvers; rowfs contract over `PostgresMemoryStore`; composite rows + pgfs with per-domain others, and without `scopeOthers` | 17/17 |
+| `postgres-diskless-config.test.ts` — `loadGatewayConfig` with/without `STORE_MODE=postgres`, overrides, `resolveStateBackend`, `resolveL0JsonlMirror` | 5/5 |
+| `state-backend.test.ts` — one behaviour suite against `LocalStateBackend` (reference) and Postgres (8 + 8), plus Postgres durability: state/queue/timers across a new backend instance, concurrent consumers, concurrent timer scanners | 19/19 |
+| `postgres-diskless.gateway.test.ts` — real gateway, stub LLM: L0 → L1 → L2 → L3, data dir and HOME empty, pgfs holds the scoped checkpoint and L1 shards but no L0 mirror and no profile files; SIGKILL during an L1 call, the next process recovers and finishes the task; L0–L3 read back via `/v3`; graceful stop, dir still empty (~95 s) | 1/1 |
+| MemoryCore `npx vitest run` | 25 files, 316/316, exit 0; without a database (`POSTGRES_TEST_URL` unreachable): 141 passed, 74 skipped, exit 0 |
+| `tsc` on `src/gateway/server.ts` (strict, nodenext) | 187 errors before and after, same set (all upstream) |
