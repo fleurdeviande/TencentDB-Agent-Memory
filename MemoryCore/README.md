@@ -236,6 +236,36 @@ embedding:
 from durable source-row counts. Missing vectors can be replayed into existing
 record IDs; source rows are not duplicated.
 
+Embedding serving aliases and runtime tuning are separate from vector schema
+identity. Set a stable identity and immutable revision when an endpoint alias can
+change without changing the vectors it produces:
+
+```yaml
+embedding:
+  model: bge-m3-ollama-runtime-alias
+  schemaIdentity: bge-m3
+  modelRevision: "2024-01"
+  normalization: l2-v1
+  dimensions: 1024
+```
+
+Endpoint, timeout, batching, and runtime-alias changes with the same identity do
+not request reindexing. Identity, revision, normalization, or dimension changes
+preserve the active index and expose an explicit shadow migration:
+
+```text
+GET  /admin/embedding/migration
+POST /admin/embedding/migration/reindex   {"confirm":true}
+POST /admin/embedding/migration/commit    {"confirm":true,"readinessThreshold":1}
+POST /admin/embedding/migration/rollback  {"confirm":true}
+```
+
+These admin routes use the gateway Bearer token and are standalone-only. Reindex
+is resumable and writes `*_vec_next`; commit cuts over transactionally only after
+the requested coverage, while rollback discards only the shadow tables. After a
+rollback, restart with the active identity (or the next intended target) before
+starting another migration.
+
 ## Storage and isolation
 
 - Memory and metadata are stored in SQLite.

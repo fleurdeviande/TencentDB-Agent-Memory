@@ -3,6 +3,7 @@
  */
 
 import type { EmbeddingHealth } from "../core/store/embedding.js";
+import type { EmbeddingMigrationStatus } from "../core/store/types.js";
 
 // ============================
 // Common
@@ -29,6 +30,7 @@ export interface HealthResponse {
       l0: { sourceRows: number; vectorRows: number; coverage: number };
       l1: { sourceRows: number; vectorRows: number; coverage: number };
     };
+    embeddingMigration?: EmbeddingMigrationStatus;
   };
   /** Integrated services status (only present when state_backend is configured) */
   services?: {

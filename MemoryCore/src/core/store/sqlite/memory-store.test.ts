@@ -13,8 +13,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { VectorStore } from "./sqlite.js";
-import type { MemoryRecord } from "../record/l1-writer.js";
+import { VectorStore } from "./memory-store.js";
+import type { MemoryRecord } from "../../record/l1-writer.js";
 
 function makeRecord(id: string, agentId: string): MemoryRecord {
   const now = new Date().toISOString();

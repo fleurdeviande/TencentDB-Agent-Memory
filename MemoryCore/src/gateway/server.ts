@@ -1136,6 +1136,14 @@ export class TdaiGateway {
       if (!this.checkAuth(req, res)) return;
 
       switch (`${method} ${pathname}`) {
+        case "GET /admin/embedding/migration":
+          return this.handleEmbeddingMigrationStatus(res);
+        case "POST /admin/embedding/migration/reindex":
+          return await this.handleEmbeddingMigrationReindex(req, res);
+        case "POST /admin/embedding/migration/commit":
+          return await this.handleEmbeddingMigrationCommit(req, res);
+        case "POST /admin/embedding/migration/rollback":
+          return await this.handleEmbeddingMigrationRollback(req, res);
         case "POST /recall":
           return await this.handleRecall(req, res);
         case "POST /capture":
@@ -1458,8 +1466,14 @@ export class TdaiGateway {
   private handleHealth(res: http.ServerResponse): void {
     const vectorStore = this.core.getVectorStore();
     const embeddingService = this.core.getEmbeddingService();
+    const embeddingMigration = vectorStore?.getEmbeddingMigrationStatus?.();
     const response: HealthResponse = {
-      status: vectorStore && embeddingService?.getHealth?.().state !== "degraded" ? "ok" : "degraded",
+      status:
+        vectorStore &&
+        embeddingService?.getHealth?.().state !== "degraded" &&
+        (!embeddingMigration || embeddingMigration.state === "none")
+          ? "ok"
+          : "degraded",
       version: VERSION,
       uptime: Math.floor((Date.now() - this.startTime) / 1000),
       stores: {
@@ -1467,6 +1481,7 @@ export class TdaiGateway {
         embeddingService: !!embeddingService,
         embeddingHealth: embeddingService?.getHealth?.(),
         vectorCoverage: vectorStore?.getVectorCoverage?.(),
+        embeddingMigration,
       },
       // Integrated services status
       services: {
@@ -1476,6 +1491,74 @@ export class TdaiGateway {
       },
     };
     sendJson(res, 200, response);
+  }
+
+  private requireStandaloneEmbeddingMigration(res: http.ServerResponse) {
+    if (this.config.deployMode !== "standalone") {
+      sendError(res, 409, "Embedding migration admin routes are standalone-only");
+      return null;
+    }
+    const store = this.core.getVectorStore();
+    if (!store?.getEmbeddingMigrationStatus) {
+      sendError(res, 409, "The configured store does not support explicit embedding migration");
+      return null;
+    }
+    return store;
+  }
+
+  private handleEmbeddingMigrationStatus(res: http.ServerResponse): void {
+    const store = this.requireStandaloneEmbeddingMigration(res);
+    if (!store) return;
+    sendJson(res, 200, store.getEmbeddingMigrationStatus!());
+  }
+
+  private async handleEmbeddingMigrationReindex(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    const store = this.requireStandaloneEmbeddingMigration(res);
+    if (!store) return;
+    const body = await parseJsonBody<{ confirm?: boolean }>(req);
+    if (body.confirm !== true) {
+      sendError(res, 400, "Explicit confirmation required: {\"confirm\":true}");
+      return;
+    }
+    const embedding = this.core.getEmbeddingService();
+    if (!embedding) {
+      sendError(res, 409, "Embedding service is unavailable");
+      return;
+    }
+    await store.reindexAll((text) => embedding.embed(text));
+    sendJson(res, 200, store.getEmbeddingMigrationStatus!());
+  }
+
+  private async handleEmbeddingMigrationCommit(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    const store = this.requireStandaloneEmbeddingMigration(res);
+    if (!store?.commitEmbeddingMigration) return;
+    const body = await parseJsonBody<{ confirm?: boolean; readinessThreshold?: number }>(req);
+    if (body.confirm !== true) {
+      sendError(res, 400, "Explicit confirmation required: {\"confirm\":true}");
+      return;
+    }
+    const threshold = typeof body.readinessThreshold === "number" ? body.readinessThreshold : 1;
+    sendJson(res, 200, store.commitEmbeddingMigration(threshold));
+  }
+
+  private async handleEmbeddingMigrationRollback(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    const store = this.requireStandaloneEmbeddingMigration(res);
+    if (!store?.rollbackEmbeddingMigration) return;
+    const body = await parseJsonBody<{ confirm?: boolean }>(req);
+    if (body.confirm !== true) {
+      sendError(res, 400, "Explicit confirmation required: {\"confirm\":true}");
+      return;
+    }
+    sendJson(res, 200, store.rollbackEmbeddingMigration());
   }
 
   private async handleRecall(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
