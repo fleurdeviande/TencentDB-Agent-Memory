@@ -1,0 +1,11 @@
+---
+# Application `agent-memory-postgres` (AppProject `stateful`): the PostgreSQL StatefulSet only.
+# The Secret it reads comes from the `agent-memory` Application (ExternalSecret is not allowed here).
+postgres:
+  enabled: true
+  externalSecret:
+    enabled: false
+core:
+  enabled: false
+knowledge:
+  enabled: false

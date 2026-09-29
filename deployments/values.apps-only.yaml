@@ -1,0 +1,7 @@
+---
+# Application `agent-memory` (AppProject `services`): MemoryCore, MemoryKnowledge, ingress and the
+# postgres ExternalSecret; the StatefulSet itself is the `agent-memory-postgres` Application.
+postgres:
+  enabled: false
+  externalSecret:
+    enabled: true

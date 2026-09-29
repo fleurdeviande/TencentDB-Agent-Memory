@@ -20,6 +20,9 @@ postgres:
   imagePullSecrets: []
   user: tdai
   database: tdai
+  externalSecret:
+    # Renders the Secret named after `name` that the StatefulSet and both apps read.
+    enabled: true
   password:
     secretStore: openbao-backend
     openbaoSecretPath: team-secrets/devops/agent-memory
