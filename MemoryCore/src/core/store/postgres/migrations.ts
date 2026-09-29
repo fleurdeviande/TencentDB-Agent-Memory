@@ -268,8 +268,38 @@ export async function ensureVectorExtension(pool: Pool): Promise<boolean> {
   return (res.rowCount ?? 0) > 0;
 }
 
+/**
+ * Postgres can raise a unique violation on pg_namespace while a namespace is created for the first
+ * time even though every CREATE SCHEMA here runs under the same advisory lock (seen on the first
+ * boot in NUE, 2026-09-29). The migration transaction rolled back, so it is safe to run again.
+ */
+export function isTransientNamespaceRace(err: unknown): boolean {
+  const e = err as { code?: string; constraint?: string; message?: string } | null;
+  return (
+    e?.code === "23505" &&
+    (e.constraint === "pg_namespace_nspname_index" || /pg_namespace_nspname_index/.test(e.message ?? ""))
+  );
+}
+
+const NAMESPACE_RACE_ATTEMPTS = 3;
+
 /** Create the schema and apply pending migrations of one component. Returns applied versions. */
 export async function runMigrations(
+  pool: Pool,
+  schema: string,
+  component: string,
+  migrations: Migration[],
+): Promise<number[]> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await runMigrationsOnce(pool, schema, component, migrations);
+    } catch (err) {
+      if (attempt >= NAMESPACE_RACE_ATTEMPTS || !isTransientNamespaceRace(err)) throw err;
+    }
+  }
+}
+
+async function runMigrationsOnce(
   pool: Pool,
   schema: string,
   component: string,
