@@ -322,7 +322,33 @@ upload → ingest → search → graph/hop → restart → re-ingest skips uncha
 
 Not ported: no copy of existing `index.db` contents into Postgres (pages/edges rebuild from disk; `source`
 rows of an existing install start empty, so the first ingest after switching re-extracts every source).
-The manager's own `_wiki_engines/wiki-sources.json` registry stays on disk, as upstream.
+The manager's own `_wiki_engines/wiki-sources.json` registry stays on disk, as upstream (moved later — see
+"Wiki files on Postgres").
+
+### Wiki files on Postgres (`pw/postgres-wiki-files`)
+
+#### Inventory (before porting)
+
+Every file the wiki engine (`engines/wiki/manager.ts`, `ingest-v2/*`), `WikiService` and the wiki routes
+read or write. `{wiki}` = `{KNOWLEDGE_DATA_DIR}/{service_id}/{team_id}/{wiki_id}`. The routes (`routes/wiki.ts`,
+`routes/tools.ts`) and the MCP server touch no files themselves; they go through `WikiService` / the manager.
+
+| path pattern | what it is | writer → readers | durable / derived |
+|---|---|---|---|
+| `{wiki}/raw/sources/**` | uploaded source files (`raw/write`), UTF-8 text today | `WikiService.rawWrite*` → `rawRead*`, ingest (`findMdFiles`: `.md`/`.txt` only), `cascade.deleteSourceFiles` (rm) | **durable** — the only copy of the user's input |
+| `{wiki}/wiki/**/*.md` (skipping any `media/` dir) | wiki pages: LLM-generated (`commitCandidates`) and hand-written (`page/write`, `locked: true`) | ingest merge, `WikiService.pageWrite*`, cascade rewrites/deletes → `page/ls|read`, manager `scanWikiDir` (index rebuild, restart restore), `scanExistingPages`, `index-builder`, `overview` | **durable** — hand-written pages and merged LLM output cannot be regenerated without re-running the LLM |
+| `{wiki}/wiki/{schema,purpose}.md` | per-wiki extraction template (defaults written by `initWikiProject` if missing) | `initWikiProject`, (users via file access) → `template.loadTemplate` | **durable** (configuration) |
+| `{wiki}/wiki/index.md` | table of contents | `index-builder.rebuildIndexFile` after every commit | derived from the pages, but served as a page |
+| `{wiki}/wiki/log.md` | ingest log (append, newest day first) | `log-writer.appendIngestLog*` | **durable** (history is not reconstructible) |
+| `{wiki}/wiki/overview.md` | LLM overview of all pages | `overview.generateOverview` | durable in practice (an LLM call to regenerate) |
+| `{wiki}/wiki/{entities,concepts,sources,comparisons,synthesis}/`, `{wiki}/.llm-wiki/` | empty directory skeleton | `initWikiProject`; `WikiService.create` makes `raw/sources/` | layout only |
+| `{wiki}/_debug/generate-fail-*.txt` | raw LLM output when a FILE block does not parse | `ingest-v2.dumpGenerateFailure` | diagnostic, never read back |
+| `{wiki}/index.db` (+ `-wal`/`-shm`) | SQLite wiki index | `index-db.ts` | derived; already in Postgres with `KNOWLEDGE_DB_URL` (above) |
+| `{KNOWLEDGE_DATA_DIR}/_wiki_engines/wiki-sources.json` | manager registry: name → `{path, status, pageCount, lastSyncAt, error}` | manager `persist()` after register/sync/ingest/remove → `loadState()` at boot | **durable** — the startup restore iterates it |
+| whole `{wiki}` dir | removed on wiki delete | `WikiService.cleanupResources` (`rmSync`) | — |
+
+Not wiki: `{KNOWLEDGE_DATA_DIR}/{service_id}/{team_id}/{code_graph_id}` (Code-Graph checkouts + codegraph
+index), `_git_known_hosts/`, temp git-auth dirs under the OS tmpdir, and `KNOWLEDGE_DB_PATH` (SQLite only).
 
 ## MemoryCore metadata on PostgreSQL (`pw/postgres-metadata`)
 
