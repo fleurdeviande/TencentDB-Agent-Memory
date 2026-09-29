@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { mkdirSync, existsSync, rmSync } from "node:fs";
 import pLimit from "p-limit";
 
-import type { Db } from "./db/client.js";
+import type { Db, KnowledgeDb } from "./db/client.js";
 import { SqliteKnowledgeStore, type IKnowledgeStore } from "./store/index.js";
 import { WikiService, type WikiWorker } from "./store/index.js";
 import { CodeGraphService, type CodeGraphWorker } from "./store/index.js";
@@ -45,7 +45,8 @@ export const globalLlmLimit = pLimit(getGlobalLlmConcurrency());
 
 export interface KnowledgeModuleConfig {
   dataDir: string;
-  db: Db;
+  /** Upstream's SQLite `Db`, or a `KnowledgeDb` from openKnowledgeDb (SQLite or Postgres). */
+  db: Db | KnowledgeDb;
   /** LLM configuration for wiki ingest. */
   llmConfig: LlmConfig;
   /** TMC callback URL for status notifications (empty = no callback). */
@@ -105,7 +106,7 @@ export interface KnowledgeModule {
  * - Mark interrupted tasks as failed
  * - Async restore synced instances
  */
-export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeModule {
+export async function createKnowledgeModule(config: KnowledgeModuleConfig): Promise<KnowledgeModule> {
   const { dataDir, db, llmConfig } = config;
 
   // Store
@@ -131,8 +132,8 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
   // No binding → global LLM_MODE decides: 'custom' uses global LLM_* direct,
   // 'proxy' (default) blanks creds so ingest fails loudly (no silent fallback).
   const llmBindingStore = createLlmBindingStore(db);
-  const resolveLlm = (serviceId: string): LlmConfig =>
-    resolveLlmConfig(serviceId, llmBindingStore.get(serviceId), llmConfig);
+  const resolveLlm = async (serviceId: string): Promise<LlmConfig> =>
+    resolveLlmConfig(serviceId, await llmBindingStore.get(serviceId), llmConfig);
 
   // Instance pool (code-graph) — lazy loading
   const _poolMap = new Map<string, CodeGraphInstance>();
@@ -187,7 +188,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     // 每次 build 现解析凭证材料（不缓存明文）；解析失败必须显式抛出，
     // 不能静默降级成匿名访问 —— 那样私有仓库会以一个含糊的认证错误失败。
     const auth = credentialId
-      ? credentialStore.resolveMaterial(serviceId, teamId, repoUrl, credentialId)
+      ? await credentialStore.resolveMaterial(serviceId, teamId, repoUrl, credentialId)
       : null;
     if (credentialId && !auth) {
       throw new Error(
@@ -254,7 +255,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     setInternalStatus("ingesting");
 
     // Per-instance LLM routing (proxy/byo/global fallback), keyed by service_id.
-    const effectiveLlm = resolveLlm(serviceId);
+    const effectiveLlm = await resolveLlm(serviceId);
     // 进度只推 Panel（Panel 内存 store + wiki/get 聚合）；KS 不落进度态
     const onProgress = config.tmcCallbackUrl
       ? buildProgressFn(config.tmcCallbackUrl, wikiId, serviceId, teamId, ingestRunId)
@@ -310,7 +311,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
   });
 
   // Restart recovery: mark interrupted tasks as failed
-  const interrupted = store.markInterruptedAsFailed();
+  const interrupted = await store.markInterruptedAsFailed();
   if (interrupted > 0) {
     log.info(`marked ${interrupted} interrupted tasks as failed`);
   }
@@ -319,7 +320,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
   void (async () => {
     // Code-graph: lazy loading, just fix stats on startup
     try {
-      const allSynced = store.listSyncedCodeGraphs();
+      const allSynced = await store.listSyncedCodeGraphs();
       for (const row of allSynced) {
         const dir = join(dataDir, row.service_id, row.team_id, row.code_graph_id);
         try {
@@ -332,7 +333,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
               nodes: rawStats.nodeCount ?? rawStats.nodes ?? 0,
               edges: rawStats.edgeCount ?? rawStats.edges ?? 0,
             });
-            store.updateCodeGraphStatus(row.service_id, row.code_graph_id, { stats_json: statsJson });
+            await store.updateCodeGraphStatus(row.service_id, row.code_graph_id, { stats_json: statsJson });
           }
           log.info(`[code-graph] restored ${row.code_graph_id}`);
         } catch (err) {
@@ -345,14 +346,14 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     }
     // Wiki: register to engine manager
     try {
-      const allSyncedWikis = store.listSyncedWikis();
+      const allSyncedWikis = await store.listSyncedWikis();
       for (const row of allSyncedWikis) {
         const dir = join(dataDir, row.service_id, row.team_id, row.wiki_id);
         try {
           wikiMgr.init({ name: row.wiki_id, path: dir });
           const pages = wikiMgr.getPages(row.wiki_id);
           if (pages.length > 0) {
-            store.updateWikiStatus(row.service_id, row.wiki_id, { page_count: pages.length });
+            await store.updateWikiStatus(row.service_id, row.wiki_id, { page_count: pages.length });
           }
           log.info(`[wiki] restored index ${row.wiki_id} (${pages.length} pages)`);
         } catch (err) {
@@ -383,7 +384,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
 
     // 解析失败（已删除 / host 不匹配）必须显式失败，不能降级成匿名探测 ——
     // 否则会把「凭证不可用」报成「仓库可达」。
-    const auth = credentialStore.resolveMaterial(serviceId, teamId, repoUrl, credentialId);
+    const auth = await credentialStore.resolveMaterial(serviceId, teamId, repoUrl, credentialId);
     if (!auth) return { ok: false, error: `git credential ${credentialId} is not usable for ${repoUrl}` };
 
     return fetcher.probe(repoUrl, branch, { auth });

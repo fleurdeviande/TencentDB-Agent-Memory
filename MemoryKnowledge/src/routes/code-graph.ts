@@ -54,14 +54,14 @@ class CredentialBindingError extends Error {}
  *   2. 凭证的 host 与 repo_url 的 host **严格相等**
  *   3. `https_token` 不得用于 `http://`（否则 Basic Authorization 明文外发）
  */
-function assertCredentialBindsRepo(
+async function assertCredentialBindsRepo(
   store: IGitCredentialStore,
   serviceId: string,
   teamId: string,
   repoUrl: string,
   credentialId: string,
-): void {
-  const row = store.get(serviceId, teamId, credentialId);
+): Promise<void> {
+  const row = await store.get(serviceId, teamId, credentialId);
   if (!row) throw new CredentialBindingError("source credential not found");
 
   const parsed = parseGitUrl(repoUrl);
@@ -245,14 +245,20 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
       }
       if (!credentialStore) return c.json(wrapError(503, credentialUnavailable()), 503);
       try {
-        assertCredentialBindsRepo(credentialStore, idFields.service_id, idFields.team_id, repoUrl, body.credential_id);
+        await assertCredentialBindsRepo(
+          credentialStore,
+          idFields.service_id,
+          idFields.team_id,
+          repoUrl,
+          body.credential_id,
+        );
       } catch (err) {
         return c.json(wrapError(404, err instanceof Error ? err.message : String(err)), 404);
       }
       credentialId = body.credential_id;
     }
 
-    const { row, existed } = cgService.create({
+    const { row, existed } = await cgService.create({
       service_id: idFields.service_id,
       team_id: idFields.team_id,
       repo_url: repoUrl,
@@ -271,7 +277,7 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
     // appends `/tools/list` | `/tools/call` directly.
     if (!existed && publicBaseUrl) {
       const serviceUrl = publicBaseUrl;
-      const updated = cgService.updateServiceUrl(idFields.service_id, row.code_graph_id, serviceUrl);
+      const updated = await cgService.updateServiceUrl(idFields.service_id, row.code_graph_id, serviceUrl);
       if (updated) return c.json(wrapOk(toCodeGraphDetail(updated)), 201);
     }
 
@@ -287,8 +293,9 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
     const limit = typeof body.limit === "number" ? body.limit : 20;
     const offset = typeof body.offset === "number" ? body.offset : 0;
 
-    const items = cgService.list(idFields.service_id, idFields.team_id, { syncStatus: status, limit, offset });
-    const total = cgService.count(idFields.service_id, idFields.team_id, status ? { syncStatus: status } : undefined);
+    const items = await cgService.list(idFields.service_id, idFields.team_id, { syncStatus: status, limit, offset });
+    const countOpts = status ? { syncStatus: status } : undefined;
+    const total = await cgService.count(idFields.service_id, idFields.team_id, countOpts);
     return c.json(wrapOk({ items: items.map(toCodeGraphDetail), total }));
   });
 
@@ -299,7 +306,7 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
     const cgId = body.code_graph_id;
     if (!isValidIdSegment(cgId)) return c.json(wrapError(400, "code_graph_id is required"), 400);
 
-    const row = cgService.getById(serviceId, cgId);
+    const row = await cgService.getById(serviceId, cgId);
     if (!row) return c.json(wrapError(404, "code graph not found"), 404);
     return c.json(wrapOk(toCodeGraphDetail(row)));
   });
@@ -327,10 +334,10 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
           return c.json(wrapError(400, "credential_id must be a valid id or null"), 400);
         }
         if (!credentialStore) return c.json(wrapError(503, credentialUnavailable()), 503);
-        const existing = cgService.getById(serviceId, cgId);
+        const existing = await cgService.getById(serviceId, cgId);
         if (!existing) return c.json(wrapError(404, "code graph not found"), 404);
         try {
-          assertCredentialBindsRepo(
+          await assertCredentialBindsRepo(
             credentialStore,
             serviceId,
             existing.team_id,
@@ -348,7 +355,7 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
       return c.json(wrapError(400, "at least one of repo_name/summary/credential_id must be provided"), 400);
     }
 
-    const updated = cgService.updateMeta(serviceId, cgId, patch);
+    const updated = await cgService.updateMeta(serviceId, cgId, patch);
     if (!updated) return c.json(wrapError(404, "code graph not found"), 404);
     return c.json(wrapOk(toCodeGraphDetail(updated)));
   });
@@ -361,10 +368,10 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
     if (!isValidIdSegment(cgId)) return c.json(wrapError(400, "code_graph_id is required"), 400);
     const requesterUserId = typeof body.user_id === "string" && body.user_id ? body.user_id : undefined;
 
-    const row = cgService.getById(serviceId, cgId);
+    const row = await cgService.getById(serviceId, cgId);
     if (!row) return c.json(wrapError(404, "code graph not found"), 404);
 
-    const result = cgService.sync(serviceId, row.team_id, cgId, requesterUserId);
+    const result = await cgService.sync(serviceId, row.team_id, cgId, requesterUserId);
     if (result.kind === "not_found") return c.json(wrapError(404, "code graph not found"), 404);
     if (result.kind === "busy") {
       // 并发拒绝：干净最小的 409 响应体（调用方用 code 判断，不 parse message）。
@@ -391,12 +398,12 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
         result.failed.push({ id: String(id), reason: "invalid id" });
         continue;
       }
-      const row = cgService.getById(serviceId, id);
+      const row = await cgService.getById(serviceId, id);
       if (!row) {
         result.failed.push({ id, reason: "not found" });
         continue;
       }
-      const ok = cgService.delete(serviceId, row.team_id, id);
+      const ok = await cgService.delete(serviceId, row.team_id, id);
       if (ok) {
         // instance pool 释放已由 service.cleanupResources(releaseInstance) 统一处理。
         result.deleted_ids.push(id);
@@ -419,7 +426,7 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
       const cgId = body.code_graph_id;
       if (!isValidIdSegment(cgId)) return c.json(wrapError(400, "code_graph_id is required"), 400);
 
-      const row = cgService.getById(serviceId, cgId);
+      const row = await cgService.getById(serviceId, cgId);
       if (!row) return c.json(wrapError(404, "code graph not found"), 404);
 
       if (row.status !== "ready") {

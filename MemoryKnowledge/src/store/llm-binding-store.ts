@@ -18,8 +18,8 @@
  */
 
 import { eq } from "drizzle-orm";
-import type { Db } from "../db/client.js";
-import { llmBinding } from "../db/schema.js";
+import { asKnowledgeDb, type Db, type KnowledgeDb } from "../db/client.js";
+import type { LlmBinding } from "../db/schema.js";
 import type { LlmConfig } from "../config.js";
 
 export type LlmBindingMode = "proxy" | "byo";
@@ -53,28 +53,31 @@ export interface LlmBindingStatus {
 }
 
 export interface ILlmBindingStore {
-  get(serviceId: string): LlmBindingRow | null;
-  listAll(): LlmBindingRow[];
-  upsert(serviceId: string, input: LlmBindingInput): LlmBindingRow;
-  status(serviceId: string): LlmBindingStatus;
+  get(serviceId: string): Promise<LlmBindingRow | null>;
+  listAll(): Promise<LlmBindingRow[]>;
+  upsert(serviceId: string, input: LlmBindingInput): Promise<LlmBindingRow>;
+  status(serviceId: string): Promise<LlmBindingStatus>;
 }
 
-export function createLlmBindingStore(db: Db): ILlmBindingStore {
+/** Accepts upstream's SQLite `Db` or a dialect-selecting `KnowledgeDb`. */
+export function createLlmBindingStore(dbOrKnowledgeDb: Db | KnowledgeDb): ILlmBindingStore {
+  const kdb = asKnowledgeDb(dbOrKnowledgeDb);
+  const db = kdb.orm;
+  const { llmBinding } = kdb.tables;
   return {
-    get(serviceId: string): LlmBindingRow | null {
-      const rows = db.select().from(llmBinding).where(eq(llmBinding.serviceId, serviceId)).all();
-      const row = rows[0];
+    async get(serviceId: string): Promise<LlmBindingRow | null> {
+      const [row] = await db.select().from(llmBinding).where(eq(llmBinding.serviceId, serviceId)).limit(1);
       return row ? toRow(row) : null;
     },
 
-    listAll(): LlmBindingRow[] {
-      const rows = db.select().from(llmBinding).all();
+    async listAll(): Promise<LlmBindingRow[]> {
+      const rows = await db.select().from(llmBinding);
       return rows.map(toRow);
     },
 
-    upsert(serviceId: string, input: LlmBindingInput): LlmBindingRow {
+    async upsert(serviceId: string, input: LlmBindingInput): Promise<LlmBindingRow> {
       const now = new Date().toISOString();
-      const existing = this.get(serviceId);
+      const existing = await this.get(serviceId);
       // api_key: undefined → 保留原值（仅 upsert 已存在记录时）；null → 清空；string → 更新
       const apiKey = input.api_key !== undefined ? input.api_key : (existing?.api_key ?? null);
       const values = {
@@ -86,7 +89,7 @@ export function createLlmBindingStore(db: Db): ILlmBindingStore {
         enabled: input.enabled === false ? 0 : 1,
         updatedAt: now,
       };
-      db.insert(llmBinding)
+      await db.insert(llmBinding)
         .values(values)
         .onConflictDoUpdate({
           target: llmBinding.serviceId,
@@ -98,20 +101,19 @@ export function createLlmBindingStore(db: Db): ILlmBindingStore {
             enabled: values.enabled,
             updatedAt: values.updatedAt,
           },
-        })
-        .run();
-      return this.get(serviceId)!;
+        });
+      return (await this.get(serviceId))!;
     },
 
-    status(serviceId: string): LlmBindingStatus {
-      const row = this.get(serviceId);
+    async status(serviceId: string): Promise<LlmBindingStatus> {
+      const row = await this.get(serviceId);
       if (!row) return { bound: false, mode: null, enabled: false };
       return { bound: true, mode: row.mode, enabled: row.enabled };
     },
   };
 }
 
-function toRow(r: typeof llmBinding.$inferSelect): LlmBindingRow {
+function toRow(r: LlmBinding): LlmBindingRow {
   return {
     service_id: r.serviceId,
     mode: (r.mode === "byo" ? "byo" : "proxy") as LlmBindingMode,

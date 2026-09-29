@@ -109,7 +109,7 @@ beforeEach(() => {
 
 describe("POST /code-graph/create + credential_id", () => {
   it("新建时绑定 credential_id", async () => {
-    const cred = seedCredential();
+    const cred = await seedCredential();
     const res = await post("/code-graph/create", {
       team_id: TEAM,
       repo_url: REPO,
@@ -134,12 +134,12 @@ describe("POST /code-graph/create + credential_id", () => {
     const cgId = first.data.code_graph_id as string;
 
     // 等第一轮 worker 跑完（失败/成功都行），模拟「再 create 一次并带凭证」
-    await vi.waitFor(() => {
-      const row = cgService.getById(SERVICE, cgId);
+    await vi.waitFor(async () => {
+      const row = await cgService.getById(SERVICE, cgId);
       expect(row?.status === "ready" || row?.status === "failed").toBe(true);
     });
 
-    const cred = seedCredential();
+    const cred = await seedCredential();
     const secondRes = await post("/code-graph/create", {
       team_id: TEAM,
       repo_url: REPO,
@@ -153,13 +153,13 @@ describe("POST /code-graph/create + credential_id", () => {
     expect(second.data.credential_id).toBe(cred.credential_id);
 
     // 换绑后应重新入队，worker 看到新凭证
-    await vi.waitFor(() => {
+    await vi.waitFor(async () => {
       expect(workerCalls.some((c) => c.credentialId === cred.credential_id)).toBe(true);
     });
   });
 
   it("幂等 create 不传 credential_id 时不覆盖已有绑定", async () => {
-    const cred = seedCredential();
+    const cred = await seedCredential();
     const first = await json(
       await post("/code-graph/create", {
         team_id: TEAM,
@@ -181,7 +181,7 @@ describe("POST /code-graph/create + credential_id", () => {
   });
 
   it("credential host 与 repo_url 不一致 → 404", async () => {
-    const cred = seedCredential("evil.example.com");
+    const cred = await seedCredential("evil.example.com");
     const res = await post("/code-graph/create", {
       team_id: TEAM,
       repo_url: REPO,
@@ -194,7 +194,7 @@ describe("POST /code-graph/create + credential_id", () => {
   });
 
   it("跨 team 的 credential_id → 404", async () => {
-    const cred = credentialStore.create({
+    const cred = await credentialStore.create({
       credential_id: genGitCredentialId(),
       service_id: SERVICE,
       team_id: "other-team",
@@ -231,11 +231,11 @@ describe("POST /code-graph/create + credential_id", () => {
     );
     const cgId = first.data.code_graph_id as string;
 
-    await vi.waitFor(() => {
-      expect(cgService.getById(SERVICE, cgId)?.status).toBe("processing");
+    await vi.waitFor(async () => {
+      expect((await cgService.getById(SERVICE, cgId))?.status).toBe("processing");
     });
 
-    const cred = seedCredential();
+    const cred = await seedCredential();
     const rebind = await json(
       await post("/code-graph/create", {
         team_id: TEAM,
@@ -248,16 +248,16 @@ describe("POST /code-graph/create + credential_id", () => {
 
     release();
 
-    await vi.waitFor(() => {
+    await vi.waitFor(async () => {
       expect(workerCalls.some((c) => c.credentialId === cred.credential_id)).toBe(true);
-      expect(cgService.getById(SERVICE, cgId)?.status).toBe("ready");
+      expect((await cgService.getById(SERVICE, cgId))?.status).toBe("ready");
     });
     expect(workerCalls[0]?.credentialId).toBeNull();
   });
 
   it("failed 后同 credential_id 再 create 会重试入队", async () => {
     workerFailOnCall = (i) => i === 0;
-    const cred = seedCredential();
+    const cred = await seedCredential();
 
     const first = await json(
       await post("/code-graph/create", {
@@ -269,8 +269,8 @@ describe("POST /code-graph/create + credential_id", () => {
     );
     const cgId = first.data.code_graph_id as string;
 
-    await vi.waitFor(() => {
-      expect(cgService.getById(SERVICE, cgId)?.status).toBe("failed");
+    await vi.waitFor(async () => {
+      expect((await cgService.getById(SERVICE, cgId))?.status).toBe("failed");
     });
     expect(workerCalls).toHaveLength(1);
 
@@ -284,14 +284,14 @@ describe("POST /code-graph/create + credential_id", () => {
     );
     expect(second.data.credential_id).toBe(cred.credential_id);
 
-    await vi.waitFor(() => {
+    await vi.waitFor(async () => {
       expect(workerCalls).toHaveLength(2);
-      expect(cgService.getById(SERVICE, cgId)?.status).toBe("ready");
+      expect((await cgService.getById(SERVICE, cgId))?.status).toBe("ready");
     });
   });
 
   it("https_token 不可用于 http:// repo_url", async () => {
-    const cred = seedCredential();
+    const cred = await seedCredential();
     const res = await post("/code-graph/create", {
       team_id: TEAM,
       repo_url: "http://git.example.com/group/repo.git",
@@ -313,7 +313,7 @@ describe("POST /code-graph/update-meta + credential_id", () => {
         branch: "main",
       }),
     );
-    const cred = seedCredential("evil.example.com");
+    const cred = await seedCredential("evil.example.com");
     const res = await post("/code-graph/update-meta", {
       code_graph_id: created.data.code_graph_id,
       credential_id: cred.credential_id,
@@ -330,7 +330,7 @@ describe("POST /code-graph/update-meta + credential_id", () => {
       }),
     );
     const cgId = created.data.code_graph_id as string;
-    const cred = seedCredential();
+    const cred = await seedCredential();
 
     const bound = await json(
       await post("/code-graph/update-meta", {

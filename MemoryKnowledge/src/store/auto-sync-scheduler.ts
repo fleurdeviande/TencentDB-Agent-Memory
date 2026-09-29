@@ -203,7 +203,7 @@ export class AutoSyncScheduler {
     try {
       log.info("[auto-sync] scan started");
 
-      const candidates = this.listSyncCandidates();
+      const candidates = await this.listSyncCandidates();
       if (candidates.length === 0) {
         log.info("[auto-sync] no ready repos");
         return;
@@ -230,14 +230,14 @@ export class AutoSyncScheduler {
    * 已在队列或 worker 处理中的仓库由 scan() 里的 inFlight Set 去重，不重复入队；
    * 单仓库的同步节奏天然由 max(sync 耗时, scanIntervalMs) 决定，无需额外冷却。
    */
-  private listSyncCandidates(): CodeGraphRow[] {
-    const syncedRefs = this.store.listSyncedCodeGraphs();
+  private async listSyncCandidates(): Promise<CodeGraphRow[]> {
+    const syncedRefs = await this.store.listSyncedCodeGraphs();
     if (syncedRefs.length === 0) return [];
 
     const candidates: CodeGraphRow[] = [];
     for (const ref of syncedRefs) {
       try {
-        const row = this.store.getCodeGraph(ref.service_id, ref.team_id, ref.code_graph_id);
+        const row = await this.store.getCodeGraph(ref.service_id, ref.team_id, ref.code_graph_id);
         if (!row) continue;
         if (row.status !== "ready") continue;
         candidates.push(row);
@@ -282,10 +282,7 @@ export class AutoSyncScheduler {
     const startMs = Date.now();
     log.info(`[auto-sync] sync ${row.code_graph_id} (${row.repo_url}@${row.branch})`);
     try {
-      // CodeGraphService.sync 目前是同步返回 SyncResult；await 兼容未来改 async 或测试 mock。
-      const result: SyncResult = await Promise.resolve(
-        this.cgService.sync(row.service_id, row.team_id, row.code_graph_id, undefined),
-      );
+      const result: SyncResult = await this.cgService.sync(row.service_id, row.team_id, row.code_graph_id, undefined);
       const durationMs = Date.now() - startMs;
       switch (result.kind) {
         case "ok":

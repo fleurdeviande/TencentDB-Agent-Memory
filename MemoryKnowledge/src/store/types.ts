@@ -265,37 +265,38 @@ export interface SyncedWikiRef {
  * filters on it. id-only accessors that do not match the given memory return
  * null/false (never a foreign tenant's row).
  */
+/** Async so one implementation serves both better-sqlite3 and node-postgres (see db/client.ts). */
 export interface IKnowledgeStore {
   // ── Code-Graph ──
-  createCodeGraph(input: CreateCodeGraphInput): CreateResult<CodeGraphRow>;
-  getCodeGraph(serviceId: string, teamId: string, codeGraphId: string): CodeGraphRow | null;
-  getCodeGraphById(serviceId: string, codeGraphId: string): CodeGraphRow | null;
-  listCodeGraphs(serviceId: string, teamId: string, opts?: ListOpts): CodeGraphRow[];
-  countCodeGraphs(serviceId: string, teamId: string, opts?: CountOpts): number;
-  updateCodeGraphStatus(serviceId: string, codeGraphId: string, patch: CodeGraphStatusPatch): void;
-  deleteCodeGraph(serviceId: string, teamId: string, codeGraphId: string): boolean;
-  updateCodeGraphMeta(serviceId: string, codeGraphId: string, patch: CodeGraphMetaPatch): CodeGraphRow | null;
+  createCodeGraph(input: CreateCodeGraphInput): Promise<CreateResult<CodeGraphRow>>;
+  getCodeGraph(serviceId: string, teamId: string, codeGraphId: string): Promise<CodeGraphRow | null>;
+  getCodeGraphById(serviceId: string, codeGraphId: string): Promise<CodeGraphRow | null>;
+  listCodeGraphs(serviceId: string, teamId: string, opts?: ListOpts): Promise<CodeGraphRow[]>;
+  countCodeGraphs(serviceId: string, teamId: string, opts?: CountOpts): Promise<number>;
+  updateCodeGraphStatus(serviceId: string, codeGraphId: string, patch: CodeGraphStatusPatch): Promise<void>;
+  deleteCodeGraph(serviceId: string, teamId: string, codeGraphId: string): Promise<boolean>;
+  updateCodeGraphMeta(serviceId: string, codeGraphId: string, patch: CodeGraphMetaPatch): Promise<CodeGraphRow | null>;
 
   // ── Wiki ──
-  createWiki(input: CreateWikiInput): CreateResult<WikiRow>;
-  getWiki(serviceId: string, teamId: string, wikiId: string): WikiRow | null;
-  getWikiById(serviceId: string, wikiId: string): WikiRow | null;
-  listWikis(serviceId: string, teamId: string, opts?: ListOpts): WikiRow[];
-  countWikis(serviceId: string, teamId: string, opts?: CountOpts): number;
-  updateWikiStatus(serviceId: string, wikiId: string, patch: WikiStatusPatch): void;
-  deleteWiki(serviceId: string, teamId: string, wikiId: string): boolean;
-  updateWikiMeta(serviceId: string, wikiId: string, patch: WikiMetaPatch): WikiRow | null;
+  createWiki(input: CreateWikiInput): Promise<CreateResult<WikiRow>>;
+  getWiki(serviceId: string, teamId: string, wikiId: string): Promise<WikiRow | null>;
+  getWikiById(serviceId: string, wikiId: string): Promise<WikiRow | null>;
+  listWikis(serviceId: string, teamId: string, opts?: ListOpts): Promise<WikiRow[]>;
+  countWikis(serviceId: string, teamId: string, opts?: CountOpts): Promise<number>;
+  updateWikiStatus(serviceId: string, wikiId: string, patch: WikiStatusPatch): Promise<void>;
+  deleteWiki(serviceId: string, teamId: string, wikiId: string): Promise<boolean>;
+  updateWikiMeta(serviceId: string, wikiId: string, patch: WikiMetaPatch): Promise<WikiRow | null>;
 
   // ── Audit ──
-  appendWikiAudit(input: AuditLogInput): void;
-  appendCodeGraphAudit(input: AuditLogInput): void;
-  listWikiAudit(serviceId: string, wikiId: string, limit?: number, offset?: number): AuditLogRow[];
-  listCodeGraphAudit(serviceId: string, codeGraphId: string, limit?: number, offset?: number): AuditLogRow[];
+  appendWikiAudit(input: AuditLogInput): Promise<void>;
+  appendCodeGraphAudit(input: AuditLogInput): Promise<void>;
+  listWikiAudit(serviceId: string, wikiId: string, limit?: number, offset?: number): Promise<AuditLogRow[]>;
+  listCodeGraphAudit(serviceId: string, codeGraphId: string, limit?: number, offset?: number): Promise<AuditLogRow[]>;
 
   // ── Restart recovery ──
   /** Sweep all non-terminal (pending/processing) assets to failed, across all tenants. */
-  markInterruptedAsFailed(reason?: string): number;
+  markInterruptedAsFailed(reason?: string): Promise<number>;
   /** All ready code-graphs (with service_id) so module.ts can rebuild per-tenant dirs. */
-  listSyncedCodeGraphs(): SyncedCodeGraphRef[];
-  listSyncedWikis(): SyncedWikiRef[];
+  listSyncedCodeGraphs(): Promise<SyncedCodeGraphRef[]>;
+  listSyncedWikis(): Promise<SyncedWikiRef[]>;
 }
