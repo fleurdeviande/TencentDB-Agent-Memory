@@ -46,7 +46,8 @@ export type DeployMode = "standalone" | "service";
  *             combination is validated at assembly, not here)
  *
  * env: `FILE_STORE_MODE`; yaml: `data.fileStore`. Default by deploy mode
- * (§5.3.1): service → cos, standalone → local.
+ * (§5.3.1): service → cos, standalone → local; `STORE_MODE=postgres` → rowfs
+ * (with the pgfs others leg nothing of the file plane touches the disk).
  */
 export type FileStoreMode = "local" | "cos" | "rowfs";
 
@@ -55,9 +56,11 @@ export type FileStoreMode = "local" | "cos" | "rowfs";
  * `fileStore === "rowfs"` (env `FILE_STORE_OTHERS` / yaml
  * `data.fileStoreOthers`). `mongofs` keeps every byte in the instance's
  * Mongo database (the TCS zero-disk form) and is only legal with
- * STORE_MODE=mongodb — validated by the selection layer, not here.
+ * STORE_MODE=mongodb — validated by the selection layer, not here. `pgfs` is
+ * the Postgres equivalent (instance schema), legal with STORE_MODE=postgres
+ * and its default there.
  */
-export type FileStoreOthersMode = "local" | "cos" | "mongofs";
+export type FileStoreOthersMode = "local" | "cos" | "mongofs" | "pgfs";
 
 /**
  * Resolve the P9 kill switch (`TDAI_BACKEND_RESOLVER` / `features.backendResolver`).
@@ -340,6 +343,13 @@ export interface GatewayConfig {
      * `fileStore === "rowfs"`.
      */
     fileStoreOthers: FileStoreOthersMode;
+    /**
+     * Mirror accepted L0 messages to `conversations/<date>.jsonl` on the file
+     * plane (env `TDAI_L0_JSONL_MIRROR` / yaml `data.l0JsonlMirror`). Default on,
+     * off with `STORE_MODE=postgres`: there the L0 table is the durable copy and
+     * the mirror would be a second, never-pruned one. See {@link resolveL0JsonlMirror}.
+     */
+    l0JsonlMirror: boolean;
   };
   features: {
     /**
@@ -365,8 +375,12 @@ export interface GatewayConfig {
 
   // ── Service-mode config (also settable via env vars, env takes priority) ──
 
-  /** State backend type. env: STATE_BACKEND. yaml: stateBackend */
-  stateBackend?: "redis" | "local";
+  /**
+   * State backend type. env: STATE_BACKEND. yaml: stateBackend. With
+   * STORE_MODE=postgres an unset or yaml "local" value becomes "postgres"
+   * (pipeline state survives restarts); env STATE_BACKEND=local still wins.
+   */
+  stateBackend?: "redis" | "local" | "postgres";
   /** Default instance ID for standalone pipeline. env: TDAI_INSTANCE_ID. yaml: instanceId */
   instanceId: string;
   redis: RedisConfig;
@@ -471,14 +485,19 @@ export function parseBrokers(brokers: string | string[]): string[] {
  *
  * Semantics (design doc §5.3.1, 2026-08-31 定稿):
  * - unset → default by deploy mode: service → `cos`, standalone → `local`;
+ *   `STORE_MODE=postgres` (the third argument) → `rowfs`;
  * - set to a valid value → that value wins over the default;
  * - set to anything else → config parse failure, fail-fast (throw).
  */
 export function resolveFileStoreMode(
   raw: string | undefined,
   deployMode: DeployMode,
+  storeMode?: string,
 ): FileStoreMode {
-  if (raw === undefined) return deployMode === "service" ? "cos" : "local";
+  if (raw === undefined) {
+    if (storeMode === "postgres") return "rowfs";
+    return deployMode === "service" ? "cos" : "local";
+  }
   if (raw === "local" || raw === "cos" || raw === "rowfs") return raw;
   throw new Error(
     `invalid FILE_STORE_MODE/data.fileStore: ${JSON.stringify(raw)} (expected "local" | "cos" | "rowfs")`,
@@ -495,12 +514,67 @@ export function resolveFileStoreMode(
 export function resolveFileStoreOthersMode(
   raw: string | undefined,
   deployMode: DeployMode,
+  storeMode?: string,
 ): FileStoreOthersMode {
-  if (raw === undefined) return deployMode === "service" ? "cos" : "local";
-  if (raw === "local" || raw === "cos" || raw === "mongofs") return raw;
+  if (raw === undefined) {
+    if (storeMode === "postgres") return "pgfs";
+    return deployMode === "service" ? "cos" : "local";
+  }
+  if (raw === "local" || raw === "cos" || raw === "mongofs" || raw === "pgfs") return raw;
   throw new Error(
-    `invalid FILE_STORE_OTHERS/data.fileStoreOthers: ${JSON.stringify(raw)} (expected "local" | "cos" | "mongofs")`,
+    `invalid FILE_STORE_OTHERS/data.fileStoreOthers: ${JSON.stringify(raw)} (expected "local" | "cos" | "mongofs" | "pgfs")`,
   );
+}
+
+/**
+ * Resolve the pipeline state backend: env `STATE_BACKEND` > STORE_MODE=postgres
+ * (which lifts an unset or yaml "local" to "postgres") > yaml `stateBackend` >
+ * undefined (the gateway then picks by deploy mode: local / redis). Unknown
+ * values stay undefined, as upstream treated them.
+ */
+export function resolveStateBackend(
+  envValue: string | undefined,
+  yamlValue: string | undefined,
+  storeMode?: string,
+): GatewayConfig["stateBackend"] {
+  const known = (v: string | undefined) =>
+    v === "redis" || v === "local" || v === "postgres" ? v : undefined;
+  const fromEnv = known(envValue);
+  if (fromEnv) return fromEnv;
+  const fromYaml = known(yamlValue);
+  if (storeMode === "postgres" && (fromYaml === undefined || fromYaml === "local")) return "postgres";
+  return fromYaml;
+}
+
+/**
+ * Whether the file plane touches the local data dir. False only for the
+ * diskless form STORE_MODE=postgres + rowfs + pgfs: then the gateway lays out
+ * no data-dir skeleton and the core writes no manifest.
+ */
+export function usesLocalDataDir(
+  data: Pick<GatewayConfig["data"], "fileStore" | "fileStoreOthers">,
+  storeMode: string | undefined = process.env.STORE_MODE,
+): boolean {
+  return !(storeMode === "postgres" && data.fileStore === "rowfs" && data.fileStoreOthers === "pgfs");
+}
+
+/**
+ * Resolve the L0 JSONL mirror switch (`TDAI_L0_JSONL_MIRROR` / `data.l0JsonlMirror`).
+ *
+ * The mirror is an audit copy of L0 next to the store (upstream: "a grep-able
+ * log alongside SQLite"); L1 reads the store and falls back to the JSONL only
+ * when the store is unavailable. With `STORE_MODE=postgres` the default is off:
+ * the L0 table already holds every message, and the mirror would land in the
+ * same database (pgfs) as an append-only duplicate nothing prunes.
+ * `on`/`true`/`1` re-enable it; invalid values fail fast.
+ */
+export function resolveL0JsonlMirror(raw: string | boolean | undefined, storeMode?: string): boolean {
+  if (raw === undefined) return storeMode !== "postgres";
+  if (typeof raw === "boolean") return raw;
+  const v = raw.trim().toLowerCase();
+  if (v === "on" || v === "true" || v === "1") return true;
+  if (v === "off" || v === "false" || v === "0") return false;
+  throw new Error(`invalid TDAI_L0_JSONL_MIRROR/data.l0JsonlMirror: ${JSON.stringify(raw)} (expected on | off)`);
 }
 
 /**
@@ -702,11 +776,23 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
   const fileStore = resolveFileStoreMode(
     env("FILE_STORE_MODE") ?? str(dataConfig, "fileStore"),
     deployMode,
+    env("STORE_MODE"),
   );
   const fileStoreOthers = resolveFileStoreOthersMode(
     env("FILE_STORE_OTHERS") ?? str(dataConfig, "fileStoreOthers"),
     deployMode,
+    env("STORE_MODE"),
   );
+
+  const l0JsonlMirror = resolveL0JsonlMirror(
+    env("TDAI_L0_JSONL_MIRROR") ?? bool(dataConfig, "l0JsonlMirror") ?? str(dataConfig, "l0JsonlMirror"),
+    env("STORE_MODE"),
+  );
+  // The v1 capture path reads the same switch from the memory config.
+  memory.capture.l0JsonlMirror = l0JsonlMirror;
+  // STORE_MODE=postgres also moves the core's own default store (v1 routes) off
+  // the vectors.db the yaml's storeBackend would open in the data dir.
+  if (env("STORE_MODE") === "postgres") memory.storeBackend = "postgres";
 
   // P9 kill switch: assembly via BackendResolver (default) vs legacy branches.
   const featuresConfig = obj(fileConfig, "features");
@@ -715,8 +801,7 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
   );
 
   // State backend (env > yaml > auto from deployMode)
-  const rawBackend = env("STATE_BACKEND") ?? str(fileConfig, "stateBackend");
-  const stateBackend = rawBackend === "redis" || rawBackend === "local" ? rawBackend : undefined;
+  const stateBackend = resolveStateBackend(env("STATE_BACKEND"), str(fileConfig, "stateBackend"), env("STORE_MODE"));
 
   // Instance ID: service mode requires explicit instanceId from request headers (x-tdai-service-id),
   // standalone mode uses configured or defaults to "default".
@@ -913,7 +998,7 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
     stateBackend,
     instanceId,
     server: { port, host, apiKey, corsOrigins },
-    data: { baseDir, fileStore, fileStoreOthers },
+    data: { baseDir, fileStore, fileStoreOthers, l0JsonlMirror },
     features: { backendResolver },
     llm,
     memory,

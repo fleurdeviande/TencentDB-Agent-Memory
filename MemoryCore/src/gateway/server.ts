@@ -22,7 +22,7 @@ import zlib from "node:zlib";
 import dayjs from "dayjs";
 import { TdaiCore } from "../core/tdai-core.js";
 import { StandaloneHostAdapter } from "../adapters/standalone/host-adapter.js";
-import { loadGatewayConfig, parseBrokers } from "./config.js";
+import { loadGatewayConfig, parseBrokers, usesLocalDataDir } from "./config.js";
 import type { GatewayConfig, GatewayConfigOverrides } from "./config.js";
 import { dbChoiceToStoreConfigs, LocalBackendResolver } from "../core/backend-selection/index.js";
 import type { BackendResolver } from "../core/backend-selection/index.js";
@@ -98,7 +98,7 @@ import {
 } from "../api-trace/index.js";
 import { readApiTraceEnabled } from "../utils/env-config.js";
 import { readMongoEnvConfig } from "../utils/env-config.js";
-import { describePostgresUrl, resolvePostgresStoreConfig } from "../core/store/postgres/config.js";
+import { describePostgresUrl, resolvePostgresStoreConfig, schemaForInstance } from "../core/store/postgres/config.js";
 import { makeSkillRouteTable } from "./skill-handlers.js";
 import { handleV3AnalyticsRoute, createAnalyticsChClientAsync } from "./analytics/index.js";
 import type { AnalyticsChClient } from "./analytics/index.js";
@@ -127,10 +127,12 @@ import { resolveV3StrictIsolation } from "../utils/env-config.js";
 import { initServerOpikTracer } from "../offload_server/opik-tracer.js";
 import { classifyError } from "./error-handler.js";
 import { LocalStorageBackend } from "../core/storage/local-backend.js";
-import { StorageAdapter } from "../core/storage/adapter.js";
+import { StorageAdapter, createScopedStorageAdapter } from "../core/storage/adapter.js";
 import { ProfileRowStorageBackend } from "../core/storage/profile-row-backend.js";
 import { CompositeStorageBackend } from "../core/storage/composite-backend.js";
 import { MongoFSBackend } from "../core/storage/mongo-fs-backend.js";
+import { PostgresFSBackend } from "../core/storage/postgres-fs-backend.js";
+import type { IStorageBackend } from "../core/storage/types.js";
 import { getSharedMongoClientPool } from "../core/store/mongodb/client-pool.js";
 import type { FsOthersKind } from "../core/backend-selection/index.js";
 import { requireProfileRowStore } from "../core/store/profile-row-store.js";
@@ -398,6 +400,9 @@ export class TdaiGateway {
       hostAdapter: adapter,
       config: this.config.memory,
       sessionFilter: new SessionFilter(this.config.memory.capture.excludeAgents),
+      // Diskless (postgres + rowfs + pgfs): the core gets its storage later
+      // (setStorage) and must not lay out a data dir in the meantime.
+      localDataDir: usesLocalDataDir(this.config.data),
       skillAssetHooks: {
         // v1 首创前置 await：抛异常 = create 失败（避免「skill 已落库但 asset
         // 缺失」的静默不一致）。standalone 模式下唯一的登记入口除了 handler 层的
@@ -542,7 +547,7 @@ export class TdaiGateway {
    */
   async start(): Promise<void> {
     // Initialize data directories
-    initDataDirectories(this.config.data.baseDir);
+    if (usesLocalDataDir(this.config.data)) initDataDirectories(this.config.data.baseDir);
 
     applyMetadataEnvFromGatewayConfig(this.config.metadata);
 
@@ -1022,6 +1027,7 @@ export class TdaiGateway {
         getEmbedding: () => this.core.getEmbeddingService(),
         getStorage: () => this.core.getStorage(),
         deployMode: this.config.deployMode,
+        l0JsonlMirror: this.config.data.l0JsonlMirror,
         // Inject pipeline introspection deps for /v2/pipeline/status (standalone-only).
         // Both can be undefined in legacy standalone (no stateBackend configured) —
         // the handler returns 503 in that case.
@@ -1902,7 +1908,7 @@ export class TdaiGateway {
    *   - service    → remote backend (default)
    *
    * env vars:
-   *   STATE_BACKEND=local|remote  — backend type
+   *   STATE_BACKEND=local|remote|postgres  — backend type (postgres: default with STORE_MODE=postgres)
    *   SCANNER_INSTANCES=inst1,inst2 — instances to scan (default: "default")
    *   SCANNER_INTERVAL_MS=500 — scan interval
    *   WORKER_POLL_MS=200 — worker poll interval
@@ -1911,7 +1917,7 @@ export class TdaiGateway {
     // Determine backend type from config (env > yaml > auto from deployMode):
     //   - "standalone" → local (in-process Map/setTimeout, zero dependencies)
     //   - "service"    → remote state backend
-    const backendType: "redis" | "local" =
+    const backendType: "redis" | "local" | "postgres" =
       this.config.stateBackend ?? (this.config.deployMode === "service" ? "redis" : "local");
 
     this.logger.info(`Starting integrated services (deployMode=${this.config.deployMode}, state_backend=${backendType})...`);
@@ -1998,6 +2004,11 @@ export class TdaiGateway {
         ["db", this.config.redis.db],
         ["keyPrefix", this.config.redis.keyPrefix],
       ]) : undefined,
+      // One schema for the whole deployment: TDAI_STATE_POSTGRES_SCHEMA, else the base POSTGRES_SCHEMA.
+      postgres: backendType === "postgres" ? {
+        url: resolvePostgresStoreConfig(this.config.memory.postgres).url,
+        schema: process.env.TDAI_STATE_POSTGRES_SCHEMA || resolvePostgresStoreConfig(this.config.memory.postgres).schema,
+      } : undefined,
     });
     this.logger.info(`State Backend created (${backendType})`);
 
@@ -2778,6 +2789,7 @@ export class TdaiGateway {
         const { mongoConfig } = await this.resolveStoreBackendConfigs(instanceId);
         return this.resolveMongoFsOthersForInstance(instanceId, mongoConfig);
       }
+      if (othersKind === "pgfs") return this.resolvePgFsOthersForInstance(instanceId);
       return this.resolveFileOthersForInstance(instanceId);
     }
     // 旧分支（TDAI_BACKEND_RESOLVER=off 回滚路径）：FILE_STORE_MODE 单点开关。
@@ -2814,15 +2826,23 @@ export class TdaiGateway {
     const others =
       othersKind === "mongofs"
         ? await this.resolveMongoFsOthersForInstance(instanceId, mongoConfig)
-        : await this.resolveFileOthersForInstance(instanceId);
+        : othersKind === "pgfs"
+          ? await this.resolvePgFsOthersForInstance(instanceId)
+          : await this.resolveFileOthersForInstance(instanceId);
     const profileBackend = new ProfileRowStorageBackend({
       store: rowStore,
       // 导航里写给模型看的读取工具名属于挂载面；工具通用改名归专项七。
       navigation: { readTool: "tdai_read_file" },
       logger: this.logger,
     });
+    // Postgres serves multi-team instances: each profile domain gets its own
+    // others-leg prefix (checkpoints, L3 scope discovery), as in local mode.
+    const scopeOthers = this.storePool.mode === "postgres"
+      ? (backend: IStorageBackend, prefix: string) =>
+          createScopedStorageAdapter(new StorageAdapter(backend), prefix).getBackend()
+      : undefined;
     const adapter = new StorageAdapter(
-      new CompositeStorageBackend({ profileBackend, others: others.getBackend(), logger: this.logger }),
+      new CompositeStorageBackend({ profileBackend, others: others.getBackend(), scopeOthers, logger: this.logger }),
     );
     this.logger.info(
       `${TAG} rowfs storage assembled (instance=${instanceId}, db=${this.storePool.mode}, others=${others.type})`,
@@ -2895,6 +2915,32 @@ export class TdaiGateway {
     }
     const db = await getSharedMongoClientPool(this.logger).getDb(mongoConfig);
     const adapter = new StorageAdapter(new MongoFSBackend({ db, logger: this.logger }));
+    if (!this.cosStorageCache) this.cosStorageCache = new Map();
+    this.cosStorageCache.set(instanceId, adapter);
+    return adapter;
+  }
+
+  /**
+   * pgfs others leg (FILE_STORE_OTHERS=pgfs, the STORE_MODE=postgres default):
+   * every non-profile key in the instance's own schema, on the shared pool.
+   * Cached per instance like the other legs; the backend holds no connection.
+   */
+  private async resolvePgFsOthersForInstance(instanceId: string): Promise<StorageAdapter> {
+    const cached = this.cosStorageCache?.get(instanceId);
+    if (cached) return cached;
+    if (this.storePool?.mode !== "postgres") {
+      throw new Error(
+        `FILE_STORE_OTHERS=pgfs requires STORE_MODE=postgres (instance=${instanceId}, store mode=${this.storePool?.mode ?? "none"})`,
+      );
+    }
+    const pg = resolvePostgresStoreConfig(this.config.memory.postgres);
+    const backend = new PostgresFSBackend({
+      url: pg.url,
+      schema: schemaForInstance(pg.schema, instanceId),
+      logger: this.logger,
+    });
+    await backend.init();
+    const adapter = new StorageAdapter(backend);
     if (!this.cosStorageCache) this.cosStorageCache = new Map();
     this.cosStorageCache.set(instanceId, adapter);
     return adapter;

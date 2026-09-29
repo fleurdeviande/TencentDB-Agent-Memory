@@ -17,12 +17,13 @@ export type {
 export { DEFAULT_PIPELINE_STATE } from "./types.js";
 
 export { LocalStateBackend } from "./local-backend.js";
+export { PostgresStateBackend } from "./postgres-backend.js";
 
 import type { IStateBackend, TimerEntry } from "./types.js";
 import { LocalStateBackend } from "./local-backend.js";
 
 export interface StateBackendConfig {
-  type: "local" | "redis";
+  type: "local" | "redis" | "postgres";
   local?: {
     onTimerExpired?: (entry: TimerEntry) => void;
   };
@@ -37,12 +38,18 @@ export interface StateBackendConfig {
     keyPrefix?: string;
     consumerGroup?: string;
   };
+  /** type === "postgres": pipeline_* tables in `schema` on the shared pool for `url`. */
+  postgres?: {
+    url: string;
+    schema: string;
+  };
 }
 
 /**
  * 工厂函数：根据配置创建对应的 State Backend。
  *
  * - type === "local": 内置 LocalStateBackend，零外部依赖
+ * - type === "postgres": PostgresStateBackend, survives restarts (STORE_MODE=postgres default)
  * - remote backend: 动态加载远程状态后端实现；如果当前构建未包含，
  *   抛出明确错误。
  */
@@ -83,6 +90,15 @@ export async function createStateBackend(config: StateBackendConfig): Promise<IS
       keyPrefix: redisCfg.keyPrefix,
       consumerGroup: redisCfg.consumerGroup,
     });
+    await backend.initialize();
+    return backend;
+  }
+
+  if (config.type === "postgres") {
+    const pgCfg = config.postgres;
+    if (!pgCfg?.url) throw new Error("[state-backend] state_backend=postgres requires a POSTGRES_URL");
+    const { PostgresStateBackend } = await import("./postgres-backend.js");
+    const backend = new PostgresStateBackend({ url: pgCfg.url, schema: pgCfg.schema });
     await backend.initialize();
     return backend;
   }

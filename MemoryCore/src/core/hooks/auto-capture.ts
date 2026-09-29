@@ -129,6 +129,8 @@ export async function performAutoCapture(params: {
           afterTimestamp,
           originalUserMessageCount,
           storage,
+          // The mirror is optional only while the store is there to hold L0.
+          writeJsonl: cfg.capture.l0JsonlMirror !== false || !vectorStore || vectorStore.isDegraded(),
         });
 
         if (filteredMessages.length === 0) {

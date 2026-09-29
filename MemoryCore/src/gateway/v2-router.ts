@@ -239,6 +239,13 @@ export interface V2RouterDeps {
    */
   deployMode: "standalone" | "service";
 
+  /**
+   * Standalone L0 JSONL mirror switch (gateway `data.l0JsonlMirror`). Unset =
+   * on (upstream); STORE_MODE=postgres turns it off by default, see
+   * resolveL0JsonlMirror.
+   */
+  l0JsonlMirror?: boolean;
+
   // ── Service-mode per-instance resolvers (optional) ──
   // When provided, v2 handlers resolve store/storage per-request using
   // auth.serviceId as the instanceId key, falling back to the static getters above.
@@ -778,7 +785,7 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   // log alongside SQLite. Service mode skips: COS is the authoritative store,
   // and writing to local FS in a multi-replica pod would be ephemeral + useless.
   // Failure is non-fatal: SQLite is the source of truth.
-  if (deps.deployMode === "standalone") {
+  if (deps.deployMode === "standalone" && deps.l0JsonlMirror !== false) {
     const storage = deps.getStorage();
     if (storage) {
       try {

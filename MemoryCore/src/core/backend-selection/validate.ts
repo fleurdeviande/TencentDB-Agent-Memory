@@ -42,10 +42,10 @@ export function validateResolution(resolution: BackendResolution): void {
   }
 
   // §5.1.1 + 两轴定稿（2026-09-02 收紧）: profile=rows maps files onto profile
-  // rows, and mongodb is the only DB whose store implements the profile-row
-  // methods — sqlite has no rows to map, tcvdb has not implemented them (the
-  // assembly guard would fail-fast anyway). Reject both before assembly.
-  if (fs.profile === "rows" && db.kind !== "mongodb") {
+  // rows; mongodb and postgres are the DBs whose stores implement the
+  // profile-row methods — sqlite has no rows to map, tcvdb has not implemented
+  // them (the assembly guard would fail-fast anyway). Reject both before assembly.
+  if (fs.profile === "rows" && db.kind !== "mongodb" && db.kind !== "postgres") {
     throw new BackendCapabilityError({
       dbKind: db.kind,
       fsKind: "rowfs",
@@ -60,6 +60,15 @@ export function validateResolution(resolution: BackendResolution): void {
       `fs.others="mongofs" requires db.kind="mongodb" (got "${db.kind}") — ` +
         `MongoFS chunks live in the instance's own Mongo database. ` +
         `Use others "local"/"cos", or select db.kind="mongodb".`,
+    );
+  }
+
+  // pgfs keeps its objects in the instance's Postgres schema.
+  if (fs.others.kind === "pgfs" && db.kind !== "postgres") {
+    throw new BackendResolutionError(
+      `fs.others="pgfs" requires db.kind="postgres" (got "${db.kind}") — ` +
+        `pgfs objects live in the instance's Postgres schema. ` +
+        `Use others "local"/"cos", or select db.kind="postgres" (STORE_MODE=postgres).`,
     );
   }
 }

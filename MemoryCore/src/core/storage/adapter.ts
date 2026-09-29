@@ -94,7 +94,9 @@ export function createScopedStorageAdapter(base: StorageAdapter, prefix: string)
  * `scene_blocks/` / `persona.md`, and every profile read would miss
  * (design doc D12 ③).
  *
- * `prefix` is ignored on the rowfs branch — it exists for the legacy wrap.
+ * `prefix` is ignored on the rowfs branch — it exists for the legacy wrap —
+ * except by a composite built with `scopeOthers`, which applies it to its
+ * others leg.
  * `isolation` undefined rebinds to the unbound (whole-set) view, matching the
  * legacy "global scope = no prefix" behaviour.
  */
@@ -111,7 +113,7 @@ export function scopeProfileStorageView(
           `refusing to serve a scoped request through an unbound row view`,
       );
     }
-    return new StorageAdapter(backend.withProfileIsolation(isolation));
+    return new StorageAdapter(backend.withProfileIsolation(isolation, prefix));
   }
   return createScopedStorageAdapter(storage, prefix);
 }

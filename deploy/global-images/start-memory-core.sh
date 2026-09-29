@@ -150,6 +150,13 @@ for v in TDAI_GATEWAY_SHARED_KEY_MODE TDAI_GATEWAY_PERSONAL_KEYS TDAI_GATEWAY_PE
   if [[ -n "${!v:-}" ]]; then AUTH_ENV_ARGS+=( -e "$v=${!v}" ); fi
 done
 
+# File plane / pipeline state overrides (pw fork). With STORE_MODE=postgres the
+# defaults are rowfs + pgfs, STATE_BACKEND=postgres and no L0 JSONL mirror, so the
+# data volume stays empty; pass these only to deviate from that.
+for v in FILE_STORE_MODE FILE_STORE_OTHERS STATE_BACKEND TDAI_STATE_POSTGRES_SCHEMA TDAI_L0_JSONL_MIRROR; do
+  if [[ -n "${!v:-}" ]]; then AUTH_ENV_ARGS+=( -e "$v=${!v}" ); fi
+done
+
 pull_image "$MEMORY_CORE_IMAGE"
 rm_container_if_exists "$CONTAINER"
 
