@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "noEmit": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@modelcontextprotocol/sdk/*": ["./node_modules/@modelcontextprotocol/sdk/dist/esm/*"],
+      "@tencentdb-agent-memory/memory-sdk-ts-v2": ["./node_modules/@tencentdb-agent-memory/memory-sdk-ts-v2/dist/index.d.ts"],
+      "zod/v4": ["./node_modules/zod/v4/index.d.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "__tests__/**/*.ts"]
+}
