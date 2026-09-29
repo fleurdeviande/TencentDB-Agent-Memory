@@ -1,0 +1,41 @@
+# Allow-list: the image needs MemoryCore, MemoryKnowledge and the entrypoint, nothing else.
+*
+!MemoryCore/
+!MemoryKnowledge/
+!deploy/pw/image/entrypoint.sh
+
+# Dependencies and build output are produced inside the image
+**/node_modules
+**/dist
+**/.git
+**/coverage
+**/*.tsbuildinfo
+**/pnpm-lock.yaml
+**/package-lock.json
+
+# Tests, docs, local data
+**/__tests__
+**/*.test.ts
+**/*.spec.ts
+**/docs
+**/*.md
+**/.data-dir
+**/data
+**/benchmark-runs
+**/.DS_Store
+**/.idea
+
+# Secrets and local configs (prod config comes from the chart's ConfigMap)
+**/.env
+**/.env.*
+MemoryCore/tdai-gateway.yaml
+MemoryCore/tdai-gateway.*.yaml
+MemoryCore/docker-compose*.yaml
+MemoryKnowledge/docker-compose.yml
+
+# Upstream images and plugins not used by the gateway
+MemoryCore/Dockerfile
+MemoryCore/.dockerignore
+MemoryKnowledge/Dockerfile
+MemoryKnowledge/.dockerignore
+MemoryKnowledge/docker
