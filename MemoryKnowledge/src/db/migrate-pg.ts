@@ -145,7 +145,7 @@ const DDL = `
 
   -- Per-wiki search index (the SQLite side keeps one index.db per wiki; see engines/wiki/index-store-pg.ts).
   -- page_meta + wiki_fts in one row: title_tok/content_tok hold the same pre-tokenised text SQLite feeds
-  -- FTS5; the generated tsvector weights the title A and the content D (ts_rank_cd weights 1.0 / 0.2 = 5:1).
+  -- FTS5; the generated tsvector labels the title A and the content D so ranking can weigh them apart.
   CREATE TABLE IF NOT EXISTS knowledge_wiki_page (
     wiki_id     TEXT NOT NULL,
     page_id     TEXT NOT NULL,
