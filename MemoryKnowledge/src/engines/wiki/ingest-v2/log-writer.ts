@@ -14,8 +14,7 @@
  * 自研实现，未参考任何 GPL 代码。
  */
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import type { PageTree } from "../page-tree.js";
 
 const HEADER = "# Ingest Log";
 
@@ -40,40 +39,32 @@ export function renderBatchLogEntry(sourcesProcessed: string[], pageCount: numbe
   return `* **batch-ingest** ${sourcesProcessed.length} sources (${list}) — wrote ${pageCount} pages`;
 }
 
-function readLogBody(logPath: string): string {
-  if (!existsSync(logPath)) return "";
-  try {
-    return readFileSync(logPath, "utf-8");
-  } catch {
-    return "";
-  }
-}
+const LOG_PATH = "wiki/log.md";
 
-function appendEntries(projectPath: string, entries: string[], now: Date): void {
-  const logPath = join(projectPath, "wiki", "log.md");
+function appendEntries(tree: PageTree, entries: string[], now: Date): void {
   const day = today(now);
-  let body = readLogBody(logPath);
+  let body = tree.get(LOG_PATH) ?? "";
   for (const entry of entries) {
     body = mergeEntry(body, day, entry);
   }
-  writeFileSync(logPath, body, "utf-8");
+  tree.set(LOG_PATH, body);
 }
 
 /**
  * 追加一条摄取日志到 wiki/log.md（最新日期分组在前）。
  *
- * @param projectPath wiki 项目根
+ * @param tree        wiki 页工作副本
  * @param sourceName  本次摄取的源文件名
  * @param pageCount   本次写入/更新的页数
  * @param now         注入时间（测试用）
  */
 export function appendIngestLog(
-  projectPath: string,
+  tree: PageTree,
   sourceName: string,
   pageCount: number,
   now = new Date(),
 ): void {
-  appendEntries(projectPath, [renderLogEntry(sourceName, pageCount)], now);
+  appendEntries(tree, [renderLogEntry(sourceName, pageCount)], now);
 }
 
 export interface BatchIngestLogInput {
@@ -87,7 +78,7 @@ export interface BatchIngestLogInput {
  * 与 appendIngestLog 共存，写入同一个 wiki/log.md。
  */
 export function appendIngestLogBatch(
-  projectPath: string,
+  tree: PageTree,
   input: BatchIngestLogInput,
   now = new Date(),
 ): void {
@@ -97,7 +88,7 @@ export function appendIngestLogBatch(
   for (const err of input.mergeErrors) {
     entries.push(`* **merge-errors** ${err}`);
   }
-  appendEntries(projectPath, entries, now);
+  appendEntries(tree, entries, now);
 }
 
 /**

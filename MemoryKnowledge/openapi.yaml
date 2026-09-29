@@ -272,6 +272,8 @@ paths:
           description: Wiki not found
         '409':
           description: Wiki is processing
+        '413':
+          description: A file or the batch exceeds a size limit (incl. KNOWLEDGE_MAX_SOURCE_BYTES)
         default:
           $ref: '#/components/responses/ErrorResponse'
 
@@ -883,6 +885,11 @@ components:
           items:
             type: string
           maxItems: 50
+        encoding:
+          type: string
+          enum: [utf-8, base64]
+          default: utf-8
+          description: base64 returns each file's bytes base64-encoded (binary sources).
 
     WikiRawWriteRequest:
       allOf:
@@ -901,6 +908,11 @@ components:
                     type: string
                   content:
                     type: string
+                  encoding:
+                    type: string
+                    enum: [utf-8, base64]
+                    default: utf-8
+                    description: base64 = content is the file's bytes base64-encoded (binary sources); size limits apply to the decoded bytes.
               maxItems: 50
 
     WikiRawRmRequest:

@@ -8,9 +8,9 @@
  * 失败不影响摄取主流程（调用方 try/catch）。
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { posix } from "node:path";
 import type { LlmClient } from "./llm.js";
+import type { PageTree } from "../page-tree.js";
 import { parseFrontmatter, buildPage } from "./frontmatter.js";
 import { createLogger } from "../../../logger.js";
 
@@ -25,48 +25,20 @@ interface PageBrief {
   description: string;
 }
 
-function collectBriefs(wikiDir: string): PageBrief[] {
+function collectBriefs(tree: PageTree): PageBrief[] {
   const out: PageBrief[] = [];
-  const walk = (dir: string) => {
-    let entries: string[];
-    try {
-      entries = readdirSync(dir);
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const full = join(dir, entry);
-      let st;
-      try {
-        st = statSync(full);
-      } catch {
-        continue;
-      }
-      if (st.isDirectory()) {
-        if (entry !== "media") walk(full);
-        continue;
-      }
-      if (!entry.endsWith(".md")) continue;
-      const rel = relative(wikiDir, full).replace(/\\/g, "/");
-      if (STRUCTURAL.has(rel)) continue;
-      let content: string;
-      try {
-        content = readFileSync(full, "utf-8");
-      } catch {
-        continue;
-      }
-      const { frontmatter } = parseFrontmatter(content);
-      out.push({
-        title:
-          typeof frontmatter.title === "string" && frontmatter.title.trim()
-            ? frontmatter.title.trim()
-            : entry.replace(/\.md$/, ""),
-        type: frontmatter.type,
-        description: typeof frontmatter.description === "string" ? frontmatter.description.trim() : "",
-      });
-    }
-  };
-  if (existsSync(wikiDir)) walk(wikiDir);
+  for (const path of tree.paths()) {
+    if (STRUCTURAL.has(path.slice("wiki/".length))) continue;
+    const { frontmatter } = parseFrontmatter(tree.get(path)!);
+    out.push({
+      title:
+        typeof frontmatter.title === "string" && frontmatter.title.trim()
+          ? frontmatter.title.trim()
+          : posix.basename(path).replace(/\.md$/, ""),
+      type: frontmatter.type,
+      description: typeof frontmatter.description === "string" ? frontmatter.description.trim() : "",
+    });
+  }
   return out;
 }
 
@@ -83,9 +55,8 @@ Requirements:
  *
  * @returns 是否写入了 overview。
  */
-export async function generateOverview(projectPath: string, llm: LlmClient): Promise<boolean> {
-  const wikiDir = join(projectPath, "wiki");
-  const briefs = collectBriefs(wikiDir);
+export async function generateOverview(tree: PageTree, llm: LlmClient): Promise<boolean> {
+  const briefs = collectBriefs(tree);
   if (briefs.length < 2) {
     log.debug("页面太少，跳过 overview 生成", { pages: briefs.length });
     return false;
@@ -106,7 +77,7 @@ export async function generateOverview(projectPath: string, llm: LlmClient): Pro
     { type: "overview", title: "Overview", description: "A global overview of this wiki", timestamp: new Date().toISOString() },
     body,
   );
-  writeFileSync(join(wikiDir, "overview.md"), content, "utf-8");
+  tree.set("wiki/overview.md", content);
   log.info("overview.md written", { pages: briefs.length, bytes: content.length });
   return true;
 }

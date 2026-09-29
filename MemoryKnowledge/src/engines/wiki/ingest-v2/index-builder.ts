@@ -11,9 +11,9 @@
  *   - 宽容：坏页/缺 frontmatter 跳过，不抛错。
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { posix } from "node:path";
 import { parseFrontmatter } from "./frontmatter.js";
+import type { PageTree } from "../page-tree.js";
 
 /** 结构性文件不列入 index。 */
 const STRUCTURAL = new Set(["index.md", "schema.md", "purpose.md", "log.md", "overview.md"]);
@@ -34,48 +34,21 @@ interface IndexEntry {
   type: string;
 }
 
-/** 扫描 wiki/ 收集所有非结构性页的索引条目。 */
-function collectEntries(wikiDir: string): IndexEntry[] {
+/** 收集 wiki/ 下所有非结构性页的索引条目。 */
+function collectEntries(tree: PageTree): IndexEntry[] {
   const out: IndexEntry[] = [];
-  const walk = (dir: string) => {
-    let entries: string[];
-    try {
-      entries = readdirSync(dir);
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const full = join(dir, entry);
-      let st;
-      try {
-        st = statSync(full);
-      } catch {
-        continue;
-      }
-      if (st.isDirectory()) {
-        if (entry !== "media") walk(full);
-        continue;
-      }
-      if (!entry.endsWith(".md")) continue;
-      const rel = relative(wikiDir, full).replace(/\\/g, "/");
-      if (STRUCTURAL.has(rel)) continue;
-      let content: string;
-      try {
-        content = readFileSync(full, "utf-8");
-      } catch {
-        continue;
-      }
-      const { frontmatter } = parseFrontmatter(content);
-      const title =
-        typeof frontmatter.title === "string" && frontmatter.title.trim()
-          ? frontmatter.title.trim()
-          : entry.replace(/\.md$/, "");
-      const description =
-        typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
-      out.push({ title, relPath: `/${rel}`, description, type: frontmatter.type });
-    }
-  };
-  if (existsSync(wikiDir)) walk(wikiDir);
+  for (const path of tree.paths()) {
+    const rel = path.slice("wiki/".length);
+    if (STRUCTURAL.has(rel)) continue;
+    const { frontmatter } = parseFrontmatter(tree.get(path)!);
+    const title =
+      typeof frontmatter.title === "string" && frontmatter.title.trim()
+        ? frontmatter.title.trim()
+        : posix.basename(path).replace(/\.md$/, "");
+    const description =
+      typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
+    out.push({ title, relPath: `/${rel}`, description, type: frontmatter.type });
+  }
   return out;
 }
 
@@ -116,14 +89,12 @@ export function renderIndex(entries: IndexEntry[]): string {
 }
 
 /**
- * 重建并覆盖写入 wiki/index.md。
+ * 重建并覆盖 wiki/index.md（写入 tree，由调用方 flush）。
  * @returns 写入的条目数（用于日志）。
  */
-export function rebuildIndexFile(projectPath: string): number {
-  const wikiDir = join(projectPath, "wiki");
-  if (!existsSync(wikiDir)) return 0;
-  const entries = collectEntries(wikiDir);
-  const text = renderIndex(entries);
-  writeFileSync(join(wikiDir, "index.md"), text, "utf-8");
+export function rebuildIndexFile(tree: PageTree): number {
+  if (!tree.exists) return 0;
+  const entries = collectEntries(tree);
+  tree.set("wiki/index.md", renderIndex(entries));
   return entries.length;
 }

@@ -12,8 +12,7 @@
  * when the metadata DB is Postgres. Manager methods that touch it are async.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "fs";
-import { join, basename, relative } from "path";
+import { join, posix } from "path";
 import Graph from "graphology";
 import pLimit, { type LimitFunction } from "p-limit";
 import type {
@@ -29,8 +28,10 @@ import type {
   ResultLink,
 } from "./types.js";
 import { graphMultiHopSearch } from "./graph-search.js";
-import { classifySources, sha256, type SourceStatus } from "./index-db.js";
+import { classifySources, type SourceStatus } from "./index-db.js";
 import { isWikiIndexMissing, sqliteWikiIndex, type IndexPageRow, type WikiIndexStore, type WikiIndexWriter } from "./index-store.js";
+import { FsWikiContentStore, type WikiContentStore, type WikiLoc } from "./content-store.js";
+import { PageTree } from "./page-tree.js";
 import { createLogger } from "../../logger.js";
 import { withSpan } from "../../telemetry.js";
 import { getIngestConcurrency } from "../../config.js";
@@ -152,8 +153,8 @@ export interface WikiSourceManager {
   remove(name: string): Promise<void>;
   search(name: string, query: string, limit?: number, options?: SearchOptions): Promise<SearchResponse>;
   graph(name: string): Promise<{ nodes: GraphNode[]; edges: GraphEdge[]; communities: CommunityInfo[] }>;
-  readPage(name: string, relPath: string): string | null;
-  getPages(name: string): WikiPage[];
+  readPage(name: string, relPath: string): Promise<string | null>;
+  getPages(name: string): Promise<WikiPage[]>;
   init(config: WikiSourceConfig): Promise<WikiSourceState>;
   ingest(name: string, llmConfig: any, opts?: IngestExecOptions): Promise<any[]>;
 }
@@ -161,6 +162,8 @@ export interface WikiSourceManager {
 export interface WikiSourceManagerOptions {
   /** Where the per-wiki index lives; default upstream's index.db. */
   index?: WikiIndexStore;
+  /** Pages, sources and the registry; default upstream's files (registry in `dataDir`). */
+  content?: WikiContentStore;
 }
 
 /** 图谱中不参与建边/展示的页类型（如内部 query 页）。 */
@@ -500,18 +503,25 @@ function buildResultLinks(resultIds: string[], pg: PageGraph, metaById: Map<stri
 
 // ── 初始化模板 ──
 
-function initWikiProject(projectPath: string): void {
-  const dirs = ["raw/sources", "wiki/entities", "wiki/concepts", "wiki/sources", "wiki/comparisons", "wiki/synthesis", ".llm-wiki"];
-  for (const dir of dirs) mkdirSync(join(projectPath, dir), { recursive: true });
+const PROJECT_DIRS = ["raw/sources", "wiki/entities", "wiki/concepts", "wiki/sources", "wiki/comparisons", "wiki/synthesis", ".llm-wiki"];
+
+async function initWikiProject(content: WikiContentStore, loc: WikiLoc): Promise<void> {
+  await content.init(loc, PROJECT_DIRS);
   const defaultFiles: [string, string][] = [
     ["wiki/schema.md", `---\ntype: schema\ntitle: Wiki Schema\n---\n\n${DEFAULT_SCHEMA}\n`],
     ["wiki/purpose.md", `---\ntype: purpose\ntitle: Wiki Purpose\n---\n\n${DEFAULT_PURPOSE}\n`],
     ["wiki/index.md", "---\ntype: index\ntitle: Index\n---\n\n# Index\n\n## Entities\n\n## Concepts\n\n## Sources\n"],
   ];
-  for (const [rel, content] of defaultFiles) {
-    const full = join(projectPath, rel);
-    if (!existsSync(full)) writeFileSync(full, content, "utf-8");
+  const put: Array<{ path: string; content: string }> = [];
+  for (const [path, text] of defaultFiles) {
+    if ((await content.readPage(loc, path)) === null) put.push({ path, content: text });
   }
+  if (put.length > 0) await content.applyPages(loc, { put, remove: [] });
+}
+
+/** Source types ingest extracts (upstream findMdFiles). */
+function isIngestibleSource(filename: string): boolean {
+  return filename.endsWith(".md") || filename.endsWith(".txt");
 }
 
 // ── Ingest（ingest-v2；增量抽取见设计 003） ──
@@ -543,7 +553,8 @@ interface IngestOutcome {
  * 导出供编排层单测（进度相位 / skipped / 全失败不 throw）。
  */
 export async function runIngestIncremental(
-  projectPath: string,
+  content: WikiContentStore,
+  loc: WikiLoc,
   oldStates: Map<string, { sha256: string; status: SourceStatus }>,
   llmConfig: any,
   onProgress?: ProgressFn,
@@ -551,22 +562,12 @@ export async function runIngestIncremental(
 ): Promise<IngestOutcome> {
   const { extractSource, commitCandidates, scanExistingPages } = await import("./ingest-v2/index.js");
   const report = createThrottledProgressFn(onProgress);
-  const sourcesDir = join(projectPath, "raw", "sources");
-  if (!existsSync(sourcesDir)) {
-    log.warn("runIngest: raw/sources 不存在，跳过", { projectPath });
-    return { results: [], processed: [], deletedSources: [...oldStates.keys()] };
-  }
+  const projectPath = loc.dir;
+  const debugDir = content.kind === "fs" ? join(projectPath, "_debug") : null;
 
-  // 扫描磁盘源，算 sha。filename = 相对 sourcesDir 的 posix 路径（与 rawWrite 的 filename 对齐）。
-  const disk = findMdFiles(sourcesDir).map((abs) => {
-    const content = readFileSync(abs, "utf-8");
-    return {
-      abs,
-      filename: relative(sourcesDir, abs).replace(/\\/g, "/"),
-      sha256: sha256(content),
-      size: Buffer.byteLength(content, "utf-8"),
-    };
-  });
+  // 源清单 + sha（filename = 相对 raw/sources 的 posix 路径，与 rawWrite 的 filename 对齐）；正文按需读取。
+  const disk = await content.listSources(loc, isIngestibleSource);
+  const tree = await PageTree.load(content, loc);
 
   const { toIngest, skipped, deleted } = classifySources(disk, oldStates);
   const skippedCount = skipped.length;
@@ -580,7 +581,7 @@ export async function runIngestIncremental(
     deleted: deleted.length,
   });
 
-  const existingPages = scanExistingPages(projectPath);
+  const existingPages = scanExistingPages(tree);
   const concurrency = getIngestConcurrency();
   const wikiLimit = pLimit(concurrency);
 
@@ -603,7 +604,12 @@ export async function runIngestIncremental(
       try {
         const candidates = await withSpan("ingest-source", async (span) => {
           span.setAttribute("source.name", d.filename);
-          const run = () => extractSource(projectPath, d.abs, llmConfig, existingPages);
+          const run = async () => {
+            const data = await content.readSource(loc, d.filename);
+            if (data === null) throw new Error(`源文件不存在: ${d.filename}`);
+            const source = { name: posix.basename(d.filename), text: data.toString("utf-8") };
+            return extractSource(tree, source, llmConfig, existingPages, { debugDir });
+          };
           return globalLlmLimit ? globalLlmLimit(run) : run();
         });
         completed++;
@@ -652,11 +658,7 @@ export async function runIngestIncremental(
   if (deleted.length > 0) {
     try {
       const { deleteSourceFiles } = await import("./ingest-v2/cascade.js");
-      await deleteSourceFiles(
-        projectPath,
-        deleted.map((fn) => join(sourcesDir, fn)),
-        { logReason: "wiki/ingest/removed-source" },
-      );
+      await deleteSourceFiles(tree, deleted, { logReason: "wiki/ingest/removed-source" });
     } catch (err) {
       log.warn("已删源级联清理失败", { error: String(err) });
     }
@@ -693,7 +695,7 @@ export async function runIngestIncremental(
   }
 
   // 无成功抽取时仍可能需要在级联删除后重建 index.md；skipLog 避免空 batch 日志
-  const { written, mergeErrors } = await commitCandidates(projectPath, allCandidates, llm, {
+  const { written, mergeErrors } = await commitCandidates(tree, allCandidates, llm, {
     globalLlmLimit,
     skipLog: allCandidates.length === 0,
   });
@@ -737,13 +739,15 @@ export async function runIngestIncremental(
     } else {
       try {
         const { generateOverview } = await import("./ingest-v2/overview.js");
-        const runOverview = () => generateOverview(projectPath, llm);
+        const runOverview = () => generateOverview(tree, llm);
         await (globalLlmLimit ? globalLlmLimit(runOverview) : runOverview());
       } catch (err) {
         log.warn("overview 生成失败（不影响摄取）", { error: String(err) });
       }
     }
   }
+
+  await tree.flush(content, loc);
 
   const results = extractResults.map((r) => {
     if (!r.ok) return { source: r.filename, filesWritten: [] as string[], error: r.error };
@@ -764,16 +768,6 @@ export async function runIngestIncremental(
   return { results, processed, deletedSources: deleted };
 }
 
-function findMdFiles(dir: string): string[] {
-  const files: string[] = [];
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry);
-    if (statSync(full).isDirectory()) files.push(...findMdFiles(full));
-    else if (entry.endsWith(".md") || entry.endsWith(".txt")) files.push(full);
-  }
-  return files;
-}
-
 // ── Factory ──
 
 export async function createWikiSourceManager(
@@ -781,49 +775,37 @@ export async function createWikiSourceManager(
   opts: WikiSourceManagerOptions = {},
 ): Promise<WikiSourceManager> {
   const index = opts.index ?? sqliteWikiIndex;
+  const content = opts.content ?? new FsWikiContentStore({ registryDir: dataDir });
   const sources = new Map<string, WikiSourceState>();
-  const stateFile = join(dataDir, "wiki-sources.json");
 
-  mkdirSync(dataDir, { recursive: true });
+  const locOf = (state: WikiSourceState): WikiLoc => ({ wikiId: state.name, dir: state.path });
 
-  function persist() {
-    writeFileSync(stateFile, JSON.stringify(Object.fromEntries(sources.entries()), null, 2), "utf-8");
+  /** Registry write for one wiki (upstream rewrote the whole wiki-sources.json). */
+  async function persist(name: string) {
+    const state = sources.get(name);
+    if (state) await content.putRegistry(state);
+    else await content.removeRegistry(name);
   }
 
-  function loadState() {
-    if (!existsSync(stateFile)) return;
-    try {
-      const raw = JSON.parse(readFileSync(stateFile, "utf-8"));
-      for (const [name, state] of Object.entries<any>(raw)) {
-        if (state.status === "scanning") { state.status = "error"; state.error = "Restart"; }
-        sources.set(name, state);
-      }
-    } catch { /* fresh start */ }
-  }
-
-  function scanWikiDir(projectPath: string): WikiPage[] {
-    const wikiDir = join(projectPath, "wiki");
-    if (!existsSync(wikiDir)) throw new Error(`wiki/ not found: ${wikiDir}`);
-    const pages: WikiPage[] = [];
-    scanRecursive(wikiDir, wikiDir, pages);
-    return pages;
-  }
-
-  function scanRecursive(baseDir: string, dir: string, pages: WikiPage[]) {
-    for (const entry of readdirSync(dir)) {
-      const full = join(dir, entry);
-      const stat = statSync(full);
-      if (stat.isDirectory()) { if (entry !== "media") scanRecursive(baseDir, full, pages); }
-      else if (entry.endsWith(".md")) {
-        try {
-          const content = readFileSync(full, "utf-8");
-          const rel = full.slice(baseDir.length + 1);
-          const id = rel.replace(/\.md$/, "").replace(/\\/g, "/");
-          const fm = extractFrontmatter(content);
-          pages.push({ id, title: fm.title || basename(entry, ".md").replace(/-/g, " "), type: fm.type, path: full, relPath: `wiki/${rel}`, content, sources: fm.sources, links: extractWikilinks(content), description: fm.description });
-        } catch { /* skip */ }
-      }
+  async function loadState() {
+    const raw = await content.loadRegistry();
+    for (const [name, state] of Object.entries<any>(raw)) {
+      if (state.status === "scanning") { state.status = "error"; state.error = "Restart"; }
+      sources.set(name, state);
     }
+  }
+
+  async function scanWikiDir(loc: WikiLoc): Promise<WikiPage[]> {
+    if (!(await content.hasPages(loc))) throw new Error(`wiki/ not found: ${join(loc.dir, "wiki")}`);
+    const pages: WikiPage[] = [];
+    for (const { path: relPath, content: text } of await content.listPages(loc)) {
+      const rel = relPath.slice("wiki/".length);
+      const id = rel.replace(/\.md$/, "");
+      const fm = extractFrontmatter(text);
+      const entry = posix.basename(rel);
+      pages.push({ id, title: fm.title || posix.basename(entry, ".md").replace(/-/g, " "), type: fm.type, path: join(loc.dir, relPath), relPath, content: text, sources: fm.sources, links: extractWikilinks(text), description: fm.description });
+    }
+    return pages;
   }
 
   /** 重建 wiki 的 index.db 索引（幂等建库 → 事务重建三表 → 驱逐读连接防 stale）。 */
@@ -893,7 +875,7 @@ export async function createWikiSourceManager(
     return { results, links, count: results.length };
   }
 
-  loadState();
+  await loadState();
   // 启动时恢复 BM25 搜索索引（重建每个 ready wiki 的 index.db / pagesMap / searchEngines）。
   // loadState 只恢复元数据（sources map）；索引数据虽持久，但为对齐磁盘正文并避免
   // search / pages / graph 在重启后返回空，仍从磁盘扫描重建一次。
@@ -906,15 +888,15 @@ export async function createWikiSourceManager(
       continue;
     }
     const wikiDir = join(state.path, "wiki");
-    if (!existsSync(wikiDir)) {
-      log.warn("Wiki dir missing on disk; mark error and skip restore", { name, path: state.path });
+    if (!(await content.hasPages(locOf(state)))) {
+      log.warn("Wiki pages missing; mark error and skip restore", { name, path: state.path });
       state.status = "error";
       state.error = `wiki dir not found: ${wikiDir}`;
       failed++;
       continue;
     }
     try {
-      const pages = scanWikiDir(state.path);
+      const pages = await scanWikiDir(locOf(state));
       await rebuildIndex(name, pages);
       restored++;
       log.info("Restored wiki index", { name, pageCount: pages.length });
@@ -933,11 +915,11 @@ export async function createWikiSourceManager(
     const state: WikiSourceState = { name: config.name, path: config.path, status: "scanning" };
     sources.set(config.name, state);
     try {
-      const pages = scanWikiDir(config.path);
+      const pages = await scanWikiDir(locOf(state));
       await rebuildIndex(config.name, pages);
       state.status = "ready"; state.pageCount = pages.length; state.lastSyncAt = new Date().toISOString();
     } catch (err) { state.status = "error"; state.error = String(err); }
-    persist();
+    await persist(config.name);
     return state;
   }
 
@@ -947,7 +929,7 @@ export async function createWikiSourceManager(
     state.status = "scanning";
     const t0 = Date.now();
     try {
-      const pages = scanWikiDir(state.path);
+      const pages = await scanWikiDir(locOf(state));
       await rebuildIndex(name, pages);
       state.status = "ready"; state.pageCount = pages.length; state.lastSyncAt = new Date().toISOString(); state.error = undefined;
       log.info("sync 完成（索引已重建）", { name, pageCount: pages.length, ms: Date.now() - t0 });
@@ -955,12 +937,12 @@ export async function createWikiSourceManager(
       state.status = "error"; state.error = String(err);
       log.error("sync 失败", { name, path: state.path, error: String(err) });
     }
-    persist();
+    await persist(name);
     return state;
   }
 
-  function init(config: WikiSourceConfig): Promise<WikiSourceState> {
-    initWikiProject(config.path);
+  async function init(config: WikiSourceConfig): Promise<WikiSourceState> {
+    await initWikiProject(content, { wikiId: config.name, dir: config.path });
     return register(config);
   }
 
@@ -982,7 +964,8 @@ export async function createWikiSourceManager(
     const outcome = await withSpan("wiki-ingest", async (span) => {
       span.setAttribute("wiki.name", name);
       return runIngestIncremental(
-        projectPath,
+        content,
+        locOf(state),
         oldStates,
         llmConfig,
         opts?.onProgress,
@@ -994,7 +977,7 @@ export async function createWikiSourceManager(
     state.status = "scanning";
     const t0 = Date.now();
     try {
-      const pages = scanWikiDir(projectPath);
+      const pages = await scanWikiDir(locOf(state));
       await index.withWrite(name, projectPath, async (w) => {
         await writeIndex(w, pages);
         for (const p of outcome.processed) await w.recordSourceIngestResult(p);
@@ -1026,10 +1009,10 @@ export async function createWikiSourceManager(
       state.status = "error";
       state.error = String(err);
       log.error("ingest 失败", { name, path: projectPath, error: String(err) });
-      persist();
+      await persist(name);
       throw err;
     }
-    persist();
+    await persist(name);
     return outcome.results;
   }
 
@@ -1039,7 +1022,7 @@ export async function createWikiSourceManager(
     list: () => [...sources.values()],
     remove: async (name) => {
       sources.delete(name);
-      persist();
+      await persist(name);
       // 先关读连接（内部 checkpoint+close）；index.db 随目录删除、Postgres 行由 WikiService.delete 的 drop 清理。
       await index.release(name);
     },
@@ -1054,17 +1037,20 @@ export async function createWikiSourceManager(
         return { nodes: [], edges: [], communities: [] };
       }
     },
-    readPage: (name, relPath) => {
+    readPage: async (name, relPath) => {
       const state = sources.get(name);
       if (!state) return null;
+      const loc = locOf(state);
+      const safe = (p: string) => posix.normalize(p) === p && !p.split("/").includes("..");
 
-      // 支持 raw/ 前缀：直接从项目根读取
+      // 支持 raw/ 前缀：raw/sources/ 下的源文件
       if (relPath.startsWith("raw/")) {
-        const fullPath = join(state.path, relPath);
-        if (!fullPath.startsWith(join(state.path, "raw"))) return null; // 防路径穿越
-        try { return readFileSync(fullPath, "utf-8"); } catch {}
-        if (!relPath.endsWith(".md")) {
-          try { return readFileSync(fullPath + ".md", "utf-8"); } catch {}
+        if (!relPath.startsWith("raw/sources/") || !safe(relPath)) return null; // 防路径穿越
+        const name = relPath.slice("raw/sources/".length);
+        const candidates = relPath.endsWith(".md") ? [name] : [name, `${name}.md`];
+        for (const c of candidates) {
+          const data = await content.readSource(loc, c).catch(() => null);
+          if (data) return data.toString("utf-8");
         }
         return null;
       }
@@ -1073,21 +1059,20 @@ export async function createWikiSourceManager(
       //   "wiki/concepts/l0-录入.md" → 完整 relPath
       //   "concepts/l0-录入.md"      → 去掉 wiki/ 前缀
       //   "concepts/l0-录入"         → id 格式（不带 .md）
-      const cleanPath = relPath.replace(/^wiki\//, "");
-      const base = join(state.path, "wiki");
-      let fullPath = join(base, cleanPath);
-      if (!fullPath.startsWith(base)) return null;
+      const cleanPath = `wiki/${relPath.replace(/^wiki\//, "")}`;
+      if (!safe(cleanPath)) return null;
       // 先直接尝试，再补 .md
-      try { return readFileSync(fullPath, "utf-8"); } catch {}
-      if (!cleanPath.endsWith(".md")) {
-        try { return readFileSync(fullPath + ".md", "utf-8"); } catch {}
+      const candidates = cleanPath.endsWith(".md") ? [cleanPath] : [cleanPath, `${cleanPath}.md`];
+      for (const c of candidates) {
+        const text = await content.readPage(loc, c).catch(() => null);
+        if (text !== null) return text;
       }
       return null;
     },
-    getPages: (name) => {
+    getPages: async (name) => {
       const state = sources.get(name);
       if (!state) return [];
-      try { return scanWikiDir(state.path); } catch { return []; }
+      try { return await scanWikiDir(locOf(state)); } catch { return []; }
     },
   };
 }

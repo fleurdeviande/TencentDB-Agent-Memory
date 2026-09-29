@@ -9,13 +9,13 @@
  *      指向已删页的 [[wikilink]]（悬空链接）。
  */
 
-import { readFileSync, writeFileSync, existsSync, rmSync, readdirSync, statSync } from "node:fs";
-import { join, basename, relative } from "node:path";
+import { posix } from "node:path";
 import { parseFrontmatter, buildPage } from "./frontmatter.js";
 import { slugify } from "./slug.js";
+import type { PageTree } from "../page-tree.js";
 
 export interface DeleteSourceFilesResult {
-  /** 被级联删除的 wiki page 绝对路径。 */
+  /** 被级联删除的 wiki page 路径（`wiki/…`）。 */
   deletedWikiPaths: string[];
   /** 被重写（去掉某源）的 wiki page 数量。 */
   rewrittenSourcePages: number;
@@ -26,76 +26,32 @@ export interface DeleteSourceFilesOptions {
   logReason?: string;
 }
 
-/** 递归收集 wiki/ 下所有 .md 页的绝对路径（跳过 media 目录）。 */
-function collectWikiPages(wikiDir: string): string[] {
-  const out: string[] = [];
-  const walk = (dir: string) => {
-    let entries: string[];
-    try {
-      entries = readdirSync(dir);
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const full = join(dir, entry);
-      let st;
-      try {
-        st = statSync(full);
-      } catch {
-        continue;
-      }
-      if (st.isDirectory()) {
-        if (entry !== "media") walk(full);
-      } else if (entry.endsWith(".md")) {
-        out.push(full);
-      }
-    }
-  };
-  if (existsSync(wikiDir)) walk(wikiDir);
-  return out;
-}
-
 /** 结构性文件不参与级联删除/重写。 */
 function isStructural(relFromWiki: string): boolean {
   return relFromWiki === "index.md" || relFromWiki === "schema.md" || relFromWiki === "purpose.md";
 }
 
 /**
- * 删除 raw 源文件并级联清理引用它们的 wiki page。
+ * 按被删源文件级联清理引用它们的 wiki page（源文件本身由调用方从 WikiContentStore 删除）。
+ * Pages are edited in `tree`; the caller flushes it.
  *
- * @param projectPath wiki 项目根
- * @param sourceFullPaths 要删除的 raw 源文件绝对路径列表
+ * @param tree wiki 页工作副本
+ * @param sourceNames 被删源文件名（相对 raw/sources/；page frontmatter 记的是 basename）
  */
 export async function deleteSourceFiles(
-  projectPath: string,
-  sourceFullPaths: string[],
+  tree: PageTree,
+  sourceNames: string[],
   _opts: DeleteSourceFilesOptions = {},
 ): Promise<DeleteSourceFilesResult> {
-  // 待删源的文件名集合（page 的 sources 里记的是文件名）。
-  const deletedNames = new Set<string>();
-  for (const p of sourceFullPaths) {
-    deletedNames.add(basename(p));
-    try {
-      if (existsSync(p)) rmSync(p, { force: true });
-    } catch {
-      /* 删除失败忽略：可能已被删 */
-    }
-  }
-
-  const wikiDir = join(projectPath, "wiki");
+  const deletedNames = new Set(sourceNames.map((n) => posix.basename(n)));
   const deletedWikiPaths: string[] = [];
   let rewrittenSourcePages = 0;
 
-  for (const pagePath of collectWikiPages(wikiDir)) {
-    const relFromWiki = relative(wikiDir, pagePath).replace(/\\/g, "/");
+  for (const pagePath of tree.paths()) {
+    const relFromWiki = pagePath.slice("wiki/".length);
     if (isStructural(relFromWiki)) continue;
 
-    let content: string;
-    try {
-      content = readFileSync(pagePath, "utf-8");
-    } catch {
-      continue;
-    }
+    const content = tree.get(pagePath)!;
     const parsed = parseFrontmatter(content);
     const sources = Array.isArray(parsed.frontmatter.sources)
       ? parsed.frontmatter.sources.filter((x): x is string => typeof x === "string")
@@ -107,21 +63,12 @@ export async function deleteSourceFiles(
 
     if (remaining.length === 0) {
       // 独占被删源 → 删页
-      try {
-        rmSync(pagePath, { force: true });
-        deletedWikiPaths.push(pagePath);
-      } catch {
-        /* ignore */
-      }
+      tree.delete(pagePath);
+      deletedWikiPaths.push(pagePath);
     } else {
       // 共享 → 重写去掉被删源
-      try {
-        const rewritten = buildPage({ ...parsed.frontmatter, sources: remaining }, parsed.body);
-        writeFileSync(pagePath, rewritten, "utf-8");
-        rewrittenSourcePages++;
-      } catch {
-        /* ignore */
-      }
+      tree.set(pagePath, buildPage({ ...parsed.frontmatter, sources: remaining }, parsed.body));
+      rewrittenSourcePages++;
     }
   }
 
@@ -129,7 +76,7 @@ export async function deleteSourceFiles(
 }
 
 export interface CascadeDeletePagesResult {
-  /** 实际删除的 wiki page 绝对路径。 */
+  /** 实际删除的 wiki page 路径（`wiki/…`）。 */
   deletedPaths: string[];
   /** 被重写（清理悬空 wikilink）的 page 数量。 */
   rewrittenFiles: number;
@@ -138,7 +85,7 @@ export interface CascadeDeletePagesResult {
 /** 从一个页路径与内容推导出它可能被 [[wikilink]] 引用的标识符（小写归一）。 */
 function linkAliasesFor(pagePath: string, content: string): Set<string> {
   const aliases = new Set<string>();
-  const base = basename(pagePath, ".md");
+  const base = posix.basename(pagePath, ".md");
   aliases.add(base.toLowerCase());
   aliases.add(slugify(base).toLowerCase());
   const { frontmatter } = parseFrontmatter(content);
@@ -156,54 +103,34 @@ function normalizeLinkTarget(raw: string): string {
 }
 
 /**
- * 删除 wiki page 文件，并清理其它 page 正文中指向已删页的 [[wikilink]]。
+ * 删除 wiki page，并清理其它 page 正文中指向已删页的 [[wikilink]]。Edits `tree`; the caller flushes it.
  *
- * @param projectPath wiki 项目根
- * @param pageFullPaths 要删除的 wiki page 绝对路径列表
+ * @param tree wiki 页工作副本
+ * @param pagePaths 要删除的 wiki page 路径（`wiki/…`）
  */
 export async function cascadeDeleteWikiPagesWithRefs(
-  projectPath: string,
-  pageFullPaths: string[],
+  tree: PageTree,
+  pagePaths: string[],
 ): Promise<CascadeDeletePagesResult> {
-  const wikiDir = join(projectPath, "wiki");
-
   // 删除前先收集被删页的 wikilink 别名，用于后续悬空链接清理。
   const deletedAliases = new Set<string>();
-  const toDelete = new Set(pageFullPaths.map((p) => p));
-  for (const p of pageFullPaths) {
-    let content = "";
-    try {
-      content = readFileSync(p, "utf-8");
-    } catch {
-      /* 可能不存在 */
-    }
-    for (const a of linkAliasesFor(p, content)) deletedAliases.add(a);
+  const toDelete = new Set(pagePaths);
+  for (const p of pagePaths) {
+    for (const a of linkAliasesFor(p, tree.get(p) ?? "")) deletedAliases.add(a);
   }
 
   // 执行删除。
   const deletedPaths: string[] = [];
-  for (const p of pageFullPaths) {
-    try {
-      if (existsSync(p)) {
-        rmSync(p, { force: true });
-        deletedPaths.push(p);
-      }
-    } catch {
-      /* ignore */
-    }
+  for (const p of pagePaths) {
+    if (tree.delete(p)) deletedPaths.push(p);
   }
 
   // 清理剩余 page 中指向已删页的 [[wikilink]]：把 [[X]] / [[X|label]] 替换为其展示文本。
   let rewrittenFiles = 0;
   const linkRe = /\[\[([^\]]+?)\]\]/g;
-  for (const pagePath of collectWikiPages(wikiDir)) {
+  for (const pagePath of tree.paths()) {
     if (toDelete.has(pagePath)) continue;
-    let content: string;
-    try {
-      content = readFileSync(pagePath, "utf-8");
-    } catch {
-      continue;
-    }
+    const content = tree.get(pagePath)!;
     let changed = false;
     const next = content.replace(linkRe, (whole, inner: string) => {
       const target = normalizeLinkTarget(inner);
@@ -216,12 +143,8 @@ export async function cascadeDeleteWikiPagesWithRefs(
       return whole;
     });
     if (changed) {
-      try {
-        writeFileSync(pagePath, next, "utf-8");
-        rewrittenFiles++;
-      } catch {
-        /* ignore */
-      }
+      tree.set(pagePath, next);
+      rewrittenFiles++;
     }
   }
 

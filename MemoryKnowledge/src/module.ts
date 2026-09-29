@@ -23,6 +23,7 @@ import {
 } from "./store/llm-binding-store.js";
 import { createWikiSourceManager, type WikiSourceManager } from "./engines/wiki/index.js";
 import { createWikiIndexStore } from "./engines/wiki/index-store.js";
+import { createWikiContentStore } from "./engines/wiki/content-store.js";
 import { indexProject, openIndex, syncIndex, getStats, closeIndex, type CodeGraphInstance } from "./engines/code/index.js";
 import {
   SourceFetcherRegistry,
@@ -64,6 +65,8 @@ export interface KnowledgeModuleConfig {
   };
   /** MUST 为 KNOWLEDGE_SECRET_KEY；为空则托管凭证不可用（公开仓库路径不受影响）。 */
   secretKey?: string;
+  /** KNOWLEDGE_MAX_SOURCE_BYTES: per-source cap of the wiki content store (default 50 MiB). */
+  maxSourceBytes?: number;
 }
 
 export interface CodeGraphInstancePool {
@@ -156,9 +159,13 @@ export async function createKnowledgeModule(config: KnowledgeModuleConfig): Prom
     },
   };
 
-  // Wiki engine manager; its index lives in the metadata DB when that is Postgres, else per-wiki index.db.
-  const wikiIndex = createWikiIndexStore(asKnowledgeDb(db));
-  const wikiMgr = await createWikiSourceManager(join(dataDir, "_wiki_engines"), { index: wikiIndex });
+  // Wiki engine manager. With a Postgres metadata DB its index, pages, sources and registry are rows there;
+  // otherwise upstream's per-wiki index.db and files under dataDir.
+  const kdb = asKnowledgeDb(db);
+  const wikiEnginesDir = join(dataDir, "_wiki_engines");
+  const wikiIndex = createWikiIndexStore(kdb);
+  const wikiContent = createWikiContentStore(kdb, { registryDir: wikiEnginesDir, maxSourceBytes: config.maxSourceBytes });
+  const wikiMgr = await createWikiSourceManager(wikiEnginesDir, { index: wikiIndex, content: wikiContent });
 
   // Source fetcher registry (git/local/ftp routing + security validation)
   const fetcherRegistry = new SourceFetcherRegistry({
@@ -279,7 +286,7 @@ export async function createKnowledgeModule(config: KnowledgeModuleConfig): Prom
     );
     setInternalStatus("rebuilding-index");
 
-    const pages = wikiMgr.getPages(wikiId);
+    const pages = await wikiMgr.getPages(wikiId);
     return { pageCount: pages.length };
   };
 
@@ -294,6 +301,7 @@ export async function createKnowledgeModule(config: KnowledgeModuleConfig): Prom
     dataRoot: dataDir,
     worker: config.wikiWorker ?? realWikiWorker,
     wikiIndex,
+    wikiContent,
     queue: sharedQueue,
     logger: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
     callbackConfig,
@@ -354,7 +362,7 @@ export async function createKnowledgeModule(config: KnowledgeModuleConfig): Prom
         const dir = join(dataDir, row.service_id, row.team_id, row.wiki_id);
         try {
           await wikiMgr.init({ name: row.wiki_id, path: dir });
-          const pages = wikiMgr.getPages(row.wiki_id);
+          const pages = await wikiMgr.getPages(row.wiki_id);
           if (pages.length > 0) {
             await store.updateWikiStatus(row.service_id, row.wiki_id, { page_count: pages.length });
           }

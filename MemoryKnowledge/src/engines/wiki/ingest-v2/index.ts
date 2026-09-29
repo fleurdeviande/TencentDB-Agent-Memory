@@ -7,8 +7,8 @@
  *
  * ingestSource() 保留为薄封装（= extract + commit 串行），现有单测/外部调用不变。 */
 
-import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, dirname, basename } from "node:path";
+import { writeFileSync, mkdirSync } from "node:fs";
+import { join, posix, resolve } from "node:path";
 import type { LimitFunction } from "p-limit";
 import { createLlmClient, type LlmClient, type RawLlmConfig } from "./llm.js";
 import { loadTemplate } from "./template.js";
@@ -29,20 +29,36 @@ import { isInsideRoot } from "./safe-path.js";
 import { rebuildIndexFile } from "./index-builder.js";
 import { appendIngestLog, appendIngestLogBatch } from "./log-writer.js";
 import { createLogger } from "../../../logger.js";
+import type { PageTree } from "../page-tree.js";
 
 const log = createLogger("wiki-ingest");
 
-/** generate 解析失败时落盘原文，便于 FILE 协议排查（不改变成功路径）。 */
+/** Characters of an unparsable generate output logged when there is no debug directory (Postgres content). */
+const DUMP_LOG_CHARS = 4000;
+
+/**
+ * generate 解析失败时落盘原文，便于 FILE 协议排查（不改变成功路径）。
+ * `debugDir` null (content in Postgres): the output goes to the log instead of a file.
+ */
 export function dumpGenerateFailure(args: {
-  projectPath: string;
+  debugDir: string | null;
   sourceName: string;
   chunkTag: string;
   output: string;
   reason: string;
 }): string | null {
-  const { projectPath, sourceName, chunkTag, output, reason } = args;
+  const { debugDir, sourceName, chunkTag, output, reason } = args;
+  if (debugDir === null) {
+    log.warn("generate 无合法 FILE（原文见日志）", {
+      source: sourceName,
+      chunk: chunkTag,
+      reason,
+      outputChars: output.length,
+      output: output.slice(0, DUMP_LOG_CHARS),
+    });
+    return null;
+  }
   try {
-    const debugDir = join(projectPath, "_debug");
     mkdirSync(debugDir, { recursive: true });
     const safeSource = sourceName.replace(/[^\w.\-]+/g, "_");
     const safeChunk = chunkTag.replace(/[^\w.\-#]+/g, "_");
@@ -83,6 +99,8 @@ export interface IngestOptions {
   llm?: LlmClient;
   /** 合并时旧页正文超过此字符数则走追加模式（OQ-1）；不传用 merge 默认值。 */
   mergeFullRewriteMaxChars?: number;
+  /** Where unparsable generate output is dumped (upstream `{wiki}/_debug`); null logs it instead. */
+  debugDir?: string | null;
   /**
    * 摄取流程（OQ-4）：
    *   - "two-stage"（默认）：先分析（抽取计划）再生成 FILE 块，质量更稳。
@@ -104,26 +122,31 @@ export interface CommitOptions extends MergeOptions {
   skipLog?: boolean;
 }
 
+/** One source document handed to extraction: its basename and UTF-8 text. */
+export interface SourceDoc {
+  name: string;
+  text: string;
+}
+
 /**
  * 阶段1：对单个源文件调 LLM 生成候选 wiki 页（纯内存，不落盘）。
- * 可安全并发调用。
+ * 可安全并发调用（只读 `tree` 里的 schema/purpose 模板）。
  *
  * 空候选语义：candidates.size === 0 视为失败（throw），与现有行为一致。
  */
 export async function extractSource(
-  projectPath: string,
-  sourcePath: string,
+  tree: PageTree,
+  source: SourceDoc,
   llmConfig: RawLlmConfig,
   existingPages: ExistingPageInfo[],
   options: IngestOptions = {},
 ): Promise<Map<string, string>> {
-  if (!existsSync(sourcePath)) throw new Error(`源文件不存在: ${sourcePath}`);
-  const sourceText = readFileSync(sourcePath, "utf-8");
-  const sourceName = basename(sourcePath);
+  const sourceText = source.text;
+  const sourceName = source.name;
   if (!sourceText.trim()) throw new Error(`源文件为空: ${sourceName}`);
 
   const llm = options.llm ?? createLlmClient(llmConfig);
-  const template = loadTemplate(projectPath);
+  const template = loadTemplate(tree);
   const systemPrompt = buildSystemPrompt(template);
   const mode = options.mode ?? "two-stage";
 
@@ -173,7 +196,7 @@ export async function extractSource(
     log.debug("FILE 块解析", { chunk: tag, outChars: out.length, files: files.length, warnings: w.length });
     if (files.length === 0 && out.trim()) {
       const dumpPath = dumpGenerateFailure({
-        projectPath,
+        debugDir: options.debugDir ?? null,
         sourceName,
         chunkTag: tag,
         output: out,
@@ -202,15 +225,18 @@ export async function extractSource(
   return candidates;
 }
 
+/** Virtual project root for the path-escape check; pages live in the content store, not under a real dir. */
+const PROJECT_ROOT = resolve("/wiki-project");
+
 /**
- * 阶段2：串行落盘 + 收尾。
+ * 阶段2：串行合并进 `tree` + 收尾（调用方 flush）。
  * - 按 relPath 聚合所有源产出的候选页，逐页 merge。
  * - 每页 try/catch：单页 merge 失败不阻塞其他页。
  * - mergePage 内部可能调 LLM，通过 globalLlmLimit 纳入全局限流。
  * - 全部落盘完成后统一跑一次 rebuildIndexFile + appendIngestLogBatch。
  */
 export async function commitCandidates(
-  projectPath: string,
+  tree: PageTree,
   allCandidates: Array<{ sourceFilename: string; candidates: Map<string, string> }>,
   /** 无候选页时可省略（仅 rebuild index）；有候选但缺失时对应页记入 mergeErrors。 */
   llm: LlmClient | undefined,
@@ -230,10 +256,9 @@ export async function commitCandidates(
   const mergeErrors: CommitResult["mergeErrors"] = [];
 
   for (const [relPath, entries] of byPage) {
-    const fullPath = join(projectPath, relPath);
     // 最后一道边界卡口：relPath 由 LLM 输出间接推导而来，必须确认它没逃出项目目录。
-    // 必须早于下面的 readFileSync——否则越界文件内容会被读进 merge prompt 而外泄。
-    if (!isInsideRoot(projectPath, fullPath)) {
+    // 必须早于下面的读取——否则越界文件内容会被读进 merge prompt 而外泄。
+    if (!isInsideRoot(PROJECT_ROOT, join(PROJECT_ROOT, relPath)) || posix.normalize(relPath) !== relPath || !relPath.startsWith("wiki/")) {
       for (const entry of entries) {
         mergeErrors.push({
           relPath,
@@ -241,10 +266,10 @@ export async function commitCandidates(
           error: `path escapes project root: ${relPath}`,
         });
       }
-      log.error("阻断越界落盘路径", { relPath, projectPath });
+      log.error("阻断越界落盘路径", { relPath });
       continue;
     }
-    let existing = existsSync(fullPath) ? readFileSync(fullPath, "utf-8") : null;
+    let existing = tree.get(relPath) ?? null;
 
     for (const entry of entries) {
       if (!llm) {
@@ -263,8 +288,7 @@ export async function commitCandidates(
           log.debug("跳过页（locked）", { relPath, source: entry.source });
           continue;
         }
-        mkdirSync(dirname(fullPath), { recursive: true });
-        writeFileSync(fullPath, decision.content, "utf-8");
+        tree.set(relPath, decision.content);
         existing = decision.content;
         if (!written.includes(relPath)) written.push(relPath);
         log.debug("写盘", { relPath, source: entry.source, bytes: decision.content.length });
@@ -276,14 +300,14 @@ export async function commitCandidates(
   }
 
   try {
-    rebuildIndexFile(projectPath);
+    rebuildIndexFile(tree);
   } catch (err) {
     log.warn("index.md 重建失败（不影响主流程）", { error: String(err) });
   }
 
   try {
     if (!skipLog) {
-      appendIngestLogBatch(projectPath, {
+      appendIngestLogBatch(tree, {
         sourcesProcessed: allCandidates.map((c) => c.sourceFilename),
         pagesWritten: written,
         mergeErrors: mergeErrors.map((e) => `${e.relPath} (from ${e.source}): ${e.error}`),
@@ -302,17 +326,17 @@ export async function commitCandidates(
  * 现有单测和外部直接调用无需改动。
  */
 export async function ingestSource(
-  projectPath: string,
-  sourcePath: string,
+  tree: PageTree,
+  source: SourceDoc,
   llmConfig: RawLlmConfig,
   options: IngestOptions = {},
 ): Promise<string[]> {
-  const existingPages = scanExistingPages(projectPath);
-  const candidates = await extractSource(projectPath, sourcePath, llmConfig, existingPages, options);
+  const existingPages = scanExistingPages(tree);
+  const candidates = await extractSource(tree, source, llmConfig, existingPages, options);
   const llm = options.llm ?? createLlmClient(llmConfig);
-  const sourceName = basename(sourcePath);
+  const sourceName = source.name;
   const { written } = await commitCandidates(
-    projectPath,
+    tree,
     [{ sourceFilename: sourceName, candidates }],
     llm,
     { fullRewriteMaxChars: options.mergeFullRewriteMaxChars, skipLog: true },
@@ -322,7 +346,7 @@ export async function ingestSource(
     return [];
   }
   try {
-    appendIngestLog(projectPath, sourceName, written.length);
+    appendIngestLog(tree, sourceName, written.length);
   } catch (err) {
     log.warn("log.md 追加失败", { error: err instanceof Error ? err.message : String(err) });
   }
@@ -331,48 +355,23 @@ export async function ingestSource(
 }
 
 /** 扫 wiki/ 得到已有页的精简信息（供 LLM 判断新建/更新）。不含结构性文件。 */
-export function scanExistingPages(projectPath: string): ExistingPageInfo[] {
-  const wikiDir = join(projectPath, "wiki");
-  if (!existsSync(wikiDir)) return [];
+export function scanExistingPages(tree: PageTree): ExistingPageInfo[] {
   const out: ExistingPageInfo[] = [];
-  walk(wikiDir, wikiDir, out);
-  return out;
-}
-
-function walk(baseDir: string, dir: string, out: ExistingPageInfo[]): void {
-  let entries: string[];
-  try {
-    entries = readdirSync(dir);
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    const full = join(dir, entry);
-    let st;
+  for (const rel of tree.paths()) {
+    if (STRUCTURAL_FILES.has(rel)) continue;
     try {
-      st = statSync(full);
+      const { frontmatter } = parseFrontmatter(tree.get(rel)!);
+      out.push({
+        relPath: rel,
+        title: typeof frontmatter.title === "string" ? frontmatter.title : posix.basename(rel, ".md"),
+        type: frontmatter.type,
+        description: typeof frontmatter.description === "string" ? frontmatter.description : undefined,
+      });
     } catch {
-      continue;
-    }
-    if (st.isDirectory()) {
-      if (entry !== "media") walk(baseDir, full, out);
-    } else if (entry.endsWith(".md")) {
-      const rel = `wiki/${full.slice(baseDir.length + 1).replace(/\\/g, "/")}`;
-      if (STRUCTURAL_FILES.has(rel)) continue;
-      try {
-        const content = readFileSync(full, "utf-8");
-        const { frontmatter } = parseFrontmatter(content);
-        out.push({
-          relPath: rel,
-          title: typeof frontmatter.title === "string" ? frontmatter.title : basename(entry, ".md"),
-          type: frontmatter.type,
-          description: typeof frontmatter.description === "string" ? frontmatter.description : undefined,
-        });
-      } catch {
-        /* 坏页跳过 */
-      }
+      /* 坏页跳过 */
     }
   }
+  return out;
 }
 
 /**
