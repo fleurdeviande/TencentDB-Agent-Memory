@@ -92,7 +92,7 @@ isolation holding across teams.
 | package | result |
 |---|---|
 | MemoryCore | vitest 27/27 upstream baseline; 93/93 with the postgres backend and contract runners; 244/244 with postgres metadata and personal keys |
-| MemoryKnowledge | vitest 161/161 upstream baseline; 173 + 4 skipped on SQLite, 177/177 on Postgres |
+| MemoryKnowledge | vitest 161/161 upstream baseline; 186 + 5 skipped on SQLite, 190 + 1 skipped on Postgres (wiki index included) |
 | MemoryCore/claude-code-plugin | tsc clean, vitest 17/17 |
 | pw/mcp | tsc clean, vitest 41/41, smoke OK (incl. a personal-key pass) |
 
@@ -186,10 +186,10 @@ Consumers of those (all synchronous today): `WikiService`, `CodeGraphService`, `
 `module.ts` (restart recovery), routes `wiki.ts`, `code-graph.ts`, `tools.ts`, `source-credential.ts`,
 `llm-binding.ts`. The MCP server (`src/mcp/`) talks HTTP and never touches the DB.
 
-Not part of the metadata DB and **not moved**: each wiki's own `index.db` (`src/engines/wiki/index-db.ts`:
-FTS5 `wiki_fts`, `page_meta`, `graph_edge`, `source`) lives in the wiki's data directory next to its
-`.md` files and is deleted with it — it is the wiki's search index, the same category as the
-code-graph index files, and FTS5 has no drop-in Postgres equivalent.
+Not part of the metadata DB: each wiki's own `index.db` (`src/engines/wiki/index-db.ts`: FTS5 `wiki_fts`,
+`page_meta`, `graph_edge`, `source`) in the wiki's data directory. It was left on disk in the first pass
+and moved afterwards — see "Wiki index on Postgres" below. The Code-Graph index (`@colbymchenry/codegraph`)
+stays on disk.
 
 ### Abstraction
 
@@ -223,7 +223,8 @@ code-graph index files, and FTS5 has no drop-in Postgres equivalent.
 | `KNOWLEDGE_DB_PATH` | `./data/knowledge.db` | unchanged; used only when `KNOWLEDGE_DB_URL` is empty. |
 | `KNOWLEDGE_TEST_DB_URL` | empty | tests only: run the DB-backed suites on Postgres, one throw-away `kt_<pid>_<rand>` schema per test DB. |
 
-Code-graph checkouts/indexes and each wiki's `index.db` stay under `KNOWLEDGE_DATA_DIR` on either dialect.
+Code-graph checkouts/indexes and the wikis' `.md` pages and raw sources stay under `KNOWLEDGE_DATA_DIR` on
+either dialect; with `KNOWLEDGE_DB_URL` set, the wiki index moves into Postgres (below).
 
 ### What changed
 
@@ -238,8 +239,8 @@ Code-graph checkouts/indexes and each wiki's `index.db` stay under `KNOWLEDGE_DA
 
 | run | result |
 |---|---|
-| `npx vitest run` (SQLite) | 173 passed, 4 skipped (Postgres-only migration tests), exit 0 |
-| `KNOWLEDGE_TEST_DB_URL=postgres://…/tdai_knowledge npx vitest run` | 177/177, exit 0; two runs in parallel also green |
+| `npx vitest run` (SQLite) | 173 passed, 4 skipped (Postgres-only migration tests), exit 0 — 186 + 5 skipped after the wiki index port |
+| `KNOWLEDGE_TEST_DB_URL=postgres://…/tdai_knowledge npx vitest run` | 177/177, exit 0; two runs in parallel also green — 190 + 1 skipped after the wiki index port |
 | `tsc --noEmit` | only the known `response-envelope.ts:57` error |
 
 173 = upstream's 161 + 4 dialect-selection tests + 8 new store tests (`knowledge-store.test.ts`, which
@@ -248,14 +249,80 @@ store-level tests). The credential-store and route suites were switched to `crea
 
 ### Known gaps
 
-- **Not moved:** each wiki's `index.db` (FTS5 search index, `page_meta`, `graph_edge`, `source`) — it
-  is per-wiki derived data in the wiki directory; porting it means replacing FTS5 with `tsvector`.
-- **No SQLite → Postgres data copy.** Switching an existing install starts with empty metadata.
+- **No SQLite → Postgres data copy.** Switching an existing install starts with empty metadata (and empty
+  wiki `source` rows; pages and edges are rebuilt from the `.md` files on registration).
 - **Wider interleaving on Postgres.** On SQLite every store call resolves within a microtask, so the
   services behave exactly as before. On Postgres, requests can interleave between awaits: e.g. a
   credential rebind that lands between `CodeGraphService.runBuild`'s "credential changed?" check and
   its `ready` write is not re-queued. Same class of race as running several replicas; not addressed.
 - `drizzle.config.ts` still targets SQLite only (drizzle-kit is not used at runtime).
+
+### Wiki index on Postgres (`pw/postgres-wiki-index`)
+
+With `KNOWLEDGE_DB_URL` set, the per-wiki index moves from one `index.db` per wiki into the metadata
+database, keyed by `wiki_id`; without it upstream's SQLite files are used, with upstream's SQL unchanged.
+The wiki `.md` pages and raw sources stay on disk.
+
+- **Interface.** `src/engines/wiki/index-store.ts` — `WikiIndexStore`: `init`, `withWrite(fn)` (one
+  transaction, serialised per wiki; writer: `replacePages`, `upsertSource`, `recordSourceIngestResult`,
+  `deleteSources`), `search`, `loadPages`, `loadEdges`, `listSources`, `readSourceStates`, `release`, `drop`.
+  SQLite adapter over `index-db.ts` (explicit `BEGIN/COMMIT` on the write connection plus an in-process
+  per-wiki lock, so an async write never blocks the event loop on `busy_timeout`); Postgres in
+  `index-store-pg.ts` on `KnowledgeDb.pgPool` — the pool `openKnowledgeDb()` opened, no second one.
+  `createWikiIndexStore(db)` picks by dialect; `module.ts` hands it to the manager and `WikiService`.
+- **Async ripple.** `createWikiSourceManager()` and the manager's `register/sync/init/search/graph/remove`
+  return promises; routes `await` them. Only a missing SQLite `index.db` (`WikiIndexMissingError`) still
+  reads as empty; Postgres errors propagate instead of turning into empty results.
+- **Tables** (in `migrate-pg.ts`, same idempotent DDL under the migration advisory lock):
+  `knowledge_wiki_page` (page_meta + pre-tokenised `title_tok`/`content_tok` + `tok_count` + generated
+  `fts tsvector` = title weight A ‖ content weight D, GIN), `knowledge_wiki_edge`, `knowledge_wiki_source`.
+  PKs lead with `wiki_id`. Writes take `pg_advisory_xact_lock(<ns>, hashtext(wiki_id))`; all SQL is
+  parameterised.
+- **Lifecycle.** Deleting a wiki (`WikiService.cleanupResources`) calls `drop`, which deletes the wiki's
+  page, edge and source rows (SQLite: closes the read connection; the directory removal deletes the file).
+  `source` rows are never touched by index rebuilds, so upload/ingest state survives restarts (the
+  startup restore only rewrites pages and edges); tested with a fresh manager + service over the same DB.
+- **Tokenisation.** Upstream does not use jieba for the wiki: `manager.ts#tokenize` lowercases, splits on
+  whitespace/punctuation, drops a small stop-word list and emits CJK bigrams plus the whole CJK run.
+  Both dialects index exactly that output. For Postgres every token is further split into letter/digit
+  runs (`[\p{L}\p{N}\p{M}]+`), which is what FTS5 `unicode61` does, so `node.js` / `v2.0` index as two
+  words on both sides instead of Postgres' host/version tokens; config `simple`.
+- **Queries.** FTS5 `"tok"*` OR … becomes `'w1' <-> 'w2':*` | … (prefix on the last word of each token
+  phrase, as in FTS5).
+
+Behavioural differences vs upstream FTS5 (Postgres only):
+
+- **Ranking.** `ts_rank_cd` (weights 1 : 1) divided by `1 - b + b·len/avg_len` (b = 0.75, the wiki's mean
+  `tok_count`); no IDF. Against FTS5 bm25 on the repo's 69 markdown files and 12 English/Chinese queries:
+  top-5 overlap 0.78, same top hit in 9/12 (plain `ts_rank_cd`: 0.58 and 4/12). Ties break by `page_id`.
+- **Title weight.** Upstream calls `bm25(wiki_fts, 5.0, 1.0)`, but bm25 weights follow column order and
+  column 0 is the `UNINDEXED page_id`, so title and content actually weigh the same. Postgres mirrors
+  that 1 : 1 (`RANK_WEIGHTS`; `{0.2,0.2,0.2,1.0}` would give the intended 5 : 1). The SQLite path keeps
+  upstream's SQL untouched.
+- **Score scale.** Scores are `rank / (1 + rank)` in (0, 1) — strong hits cluster at 0.85–0.98 — while
+  upstream returns raw `-bm25` (unbounded, ~1–10 on real wikis, but ~1e-6 on tiny ones where FTS5
+  clamps IDF). With `hop > 0` the default `decay 0.5` / `minScore 0.1` therefore stop expansion after
+  about 3 hops instead of 5; callers can lower `minScore`.
+- **Snippets** are unchanged: upstream returns a static `page_meta.snippet` (description or first 80
+  chars), no FTS highlighting on either dialect.
+- **Limits.** Per page at most 500 000 characters of token text are indexed (tsvector's 1 MB cap);
+  Postgres clamps positions above 16 383 and ignores words longer than 2 047 bytes.
+- **Planner.** One GIN index over all wikis, filtered by `wiki_id` (a composite would need `btree_gin`).
+
+Tests: `index-store.test.ts` (store contract on the test dialect: English/Chinese/prefix/punctuation
+search, wiki isolation, rebuilds keep sources, source lifecycle, rollback, concurrent writes, drop,
+missing index.db) and `wiki-index-lifecycle.test.ts` (WikiService + manager with the LLM stages stubbed:
+upload → ingest → search → graph/hop → restart → re-ingest skips unchanged sources → delete).
+
+| run | result |
+|---|---|
+| `npx vitest run` (SQLite) | 186 passed, 5 skipped (Postgres-only), exit 0 |
+| `KNOWLEDGE_TEST_DB_URL=postgres://tdai:tdai-dev@127.0.0.1:55432/tdai_knowledge npx vitest run` | 190 passed, 1 skipped (SQLite-only), exit 0 |
+| `tsc --noEmit` | only the known `response-envelope.ts:57` error |
+
+Not ported: no copy of existing `index.db` contents into Postgres (pages/edges rebuild from disk; `source`
+rows of an existing install start empty, so the first ingest after switching re-extracts every source).
+The manager's own `_wiki_engines/wiki-sources.json` registry stays on disk, as upstream.
 
 ## MemoryCore metadata on PostgreSQL (`pw/postgres-metadata`)
 
@@ -358,7 +425,7 @@ Results (Node 22, pgvector/pgvector:pg17):
 | MemoryCore/claude-code-plugin | tsc clean, vitest 17/17, exit 0 |
 | pw/mcp | tsc clean (exit 0), vitest 41/41 (exit 0), `npm run smoke` → SMOKE OK (exit 0) |
 
-Still not on PostgreSQL: MemoryKnowledge's per-wiki `index.db` (FTS5, see above) and code-graph index files;
+Still not on PostgreSQL: code-graph index files (third-party `@colbymchenry/codegraph`, rebuildable from git);
 the file plane (`FILE_STORE_MODE=local`: L2/L3 markdown, checkpoints, `.metadata/*.json`, the standalone L0
 JSONL mirror) and `LocalStateBackend`'s pipeline state; MemoryProxy's own SQLite (the proxy is not used).
 SQLite stays the default for every store when `STORE_MODE` is not `postgres`.

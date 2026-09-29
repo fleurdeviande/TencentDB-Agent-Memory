@@ -32,17 +32,8 @@ import type {
   CountOpts,
 } from "./types.js";
 import { BuildQueue } from "./build-queue.js";
-import {
-  initIndexDb,
-  withWriteDb,
-  getReadDb,
-  evictWikiDb,
-  upsertSource,
-  listSources,
-  deleteSources,
-  sha256,
-  type SourceStatus,
-} from "../engines/wiki/index-db.js";
+import { sha256, type SourceStatus } from "../engines/wiki/index-db.js";
+import { isWikiIndexMissing, sqliteWikiIndex, type WikiIndexStore } from "../engines/wiki/index-store.js";
 
 export interface WikiBuildContext {
   wikiId: string;
@@ -82,6 +73,8 @@ export interface WikiServiceOptions {
   store: IKnowledgeStore;
   dataRoot: string;
   worker: WikiWorker;
+  /** Wiki index backend (default upstream's per-wiki index.db); module.ts passes the Postgres one when configured. */
+  wikiIndex?: WikiIndexStore;
   queue?: BuildQueue;
   logger?: WikiServiceLogger;
   /** Callback config for TMC status notifications. Optional. */
@@ -208,6 +201,7 @@ export class WikiService {
   private readonly store: IKnowledgeStore;
   private readonly dataRoot: string;
   private readonly worker: WikiWorker;
+  private readonly index: WikiIndexStore;
   private readonly queue: BuildQueue;
   private readonly logger?: WikiServiceLogger;
   private readonly callbackConfig?: {
@@ -225,6 +219,7 @@ export class WikiService {
     this.store = opts.store;
     this.dataRoot = opts.dataRoot;
     this.worker = opts.worker;
+    this.index = opts.wikiIndex ?? sqliteWikiIndex;
     this.queue = opts.queue ?? new BuildQueue();
     this.logger = opts.logger;
     this.callbackConfig = opts.callbackConfig;
@@ -245,7 +240,7 @@ export class WikiService {
       mkdirSync(join(dir, "raw", "sources"), { recursive: true });
       // 显式建 index.db（4 表，含 source）——此后 rawWrite/rawLs 直接读写 source 表（设计 006/003）。
       try {
-        initIndexDb(dir);
+        await this.index.init(row.wiki_id, dir);
       } catch (err) {
         this.logger?.warn?.(`[wiki] initIndexDb failed for ${row.wiki_id}: ${String(err)}`);
       }
@@ -340,14 +335,14 @@ export class WikiService {
 
   /**
    * 四类资源幂等清理（顺序：先释放连接，再删盘）。每步独立 try/catch，异常安全。
-   *   1. index.db 读连接池：evictWikiDb（幂等；worker 的 withWriteDb finally 本就 close 写连接）
+   *   1. wiki 索引：index.drop（SQLite 关读连接；Postgres 删该 wiki 的 page/edge/source 行；幂等）
    *   2. 元数据行：硬删（命中 0 行也安全，支持 worker + delete 双重清理）
    *   3. 磁盘目录（wiki/ raw/ index.db 及 -wal/-shm）：rmSync recursive+force（幂等）
    * BuildQueue 排队任务由 runBuild 入口检查 cancelled/行存在性跳过，无需在此处理。
    */
   private async cleanupResources(serviceId: string, teamId: string, wikiId: string): Promise<void> {
     try {
-      evictWikiDb(wikiId);
+      await this.index.drop(wikiId, this.dirFor(serviceId, teamId, wikiId));
     } catch (err) {
       this.logger?.warn?.(`[wiki] evict index.db failed ${wikiId}: ${String(err)}`);
     }
@@ -414,8 +409,7 @@ export class WikiService {
     if (!row) return null;
     const dir = this.dirFor(serviceId, teamId, wikiId);
     try {
-      const db = getReadDb(wikiId, dir);
-      return listSources(db).map((s) => ({
+      return (await this.index.listSources(wikiId, dir)).map((s) => ({
         filename: s.filename,
         size: s.size,
         status: s.status,
@@ -425,7 +419,8 @@ export class WikiService {
         ingested_at: s.ingested_at,
         uploaded_at: s.created_at, // 兼容旧字段
       }));
-    } catch {
+    } catch (err) {
+      if (!isWikiIndexMissing(err)) throw err;
       // index.db 尚未创建（老 wiki / 从未 rawWrite）→ 无 source 登记。
       return [];
     }
@@ -512,7 +507,7 @@ export class WikiService {
 
     mkdirSync(sourcesDir, { recursive: true });
     writeFileSync(safe, content, "utf-8");
-    this.registerSources(serviceId, teamId, wikiId, [{ filename, content, size }], userId);
+    await this.registerSources(serviceId, teamId, wikiId, [{ filename, content, size }], userId);
     return { filename, size };
   }
 
@@ -585,7 +580,7 @@ export class WikiService {
     }
 
     // 全部落盘成功后登记 source 表（先查再更新，sha 未变幂等）。
-    this.registerSources(
+    await this.registerSources(
       serviceId,
       teamId,
       wikiId,
@@ -635,8 +630,8 @@ export class WikiService {
 
     // 删除对应 source 行（与文件级联删除对应，设计 003 §5）。
     try {
-      initIndexDb(projectPath);
-      withWriteDb(projectPath, (db) => deleteSources(db, filenames));
+      await this.index.init(wikiId, projectPath);
+      await this.index.withWrite(wikiId, projectPath, (w) => w.deleteSources(filenames));
     } catch (err) {
       this.logger?.warn?.(`[wiki] source rows delete failed: ${String(err)}`);
     }
@@ -889,19 +884,19 @@ export class WikiService {
    * （先查再更新：新建 uploaded / sha 变则重置 uploaded / sha 未变幂等）。
    * 登记失败不阻断写盘主流程（文件已落盘）——记 warn，交由后续 ingest/rawLs 兜底。
    */
-  private registerSources(
+  private async registerSources(
     serviceId: string,
     teamId: string,
     wikiId: string,
     files: { filename: string; content: string; size: number }[],
     userId?: string,
-  ): void {
+  ): Promise<void> {
     const dir = this.dirFor(serviceId, teamId, wikiId);
     try {
-      initIndexDb(dir);
-      withWriteDb(dir, (db) => {
+      await this.index.init(wikiId, dir);
+      await this.index.withWrite(wikiId, dir, async (w) => {
         for (const f of files) {
-          upsertSource(db, {
+          await w.upsertSource({
             filename: f.filename,
             sha256: sha256(f.content),
             size: f.size,

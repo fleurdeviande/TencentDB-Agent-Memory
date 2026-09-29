@@ -160,12 +160,7 @@ export function getReadDb(wikiId: string, wikiDir: string): Database.Database {
  * `fn` 内的重建（FTS5 + graph_edge + page_meta + source）在同一事务里原子完成。
  */
 export function withWriteDb<T>(wikiDir: string, fn: (db: Database.Database) => T): T {
-  const path = dbPath(wikiDir);
-  if (!existsSync(path)) {
-    throw new Error(`index.db missing (wiki not created?): ${wikiDir}`);
-  }
-  const db = new Database(path);
-  applyPragmas(db);
+  const db = openWriteDb(wikiDir);
   try {
     const out = db.transaction(fn)(db);
     db.pragma("wal_checkpoint(TRUNCATE)");
@@ -173,6 +168,17 @@ export function withWriteDb<T>(wikiDir: string, fn: (db: Database.Database) => T
   } finally {
     db.close();
   }
+}
+
+/** The write connection of withWriteDb, for callers that drive the transaction themselves (index-store.ts). */
+export function openWriteDb(wikiDir: string): Database.Database {
+  const path = dbPath(wikiDir);
+  if (!existsSync(path)) {
+    throw new Error(`index.db missing (wiki not created?): ${wikiDir}`);
+  }
+  const db = new Database(path);
+  applyPragmas(db);
+  return db;
 }
 
 /** wiki 删除：先关读连接（dispose 内部 checkpoint+close），调用方再 rmSync 目录。 */

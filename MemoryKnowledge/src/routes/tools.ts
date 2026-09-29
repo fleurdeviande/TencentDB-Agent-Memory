@@ -324,7 +324,7 @@ async function executeWikiTool(
         return Response.json(wrapOk({ results: [], links: [], count: 0 }));
       }
       const limit = typeof params.limit === "number" ? params.limit : 20;
-      const response = wikiMgr.search(wiki_id, query, limit);
+      const response = await wikiMgr.search(wiki_id, query, limit);
       return Response.json(wrapOk(response));
     }
     case "list_pages": {
@@ -350,7 +350,7 @@ async function executeWikiTool(
       if (row.status !== "ready") {
         return Response.json(wrapOk({ nodes: [], edges: [], communities: [] }));
       }
-      const graphData = wikiMgr.graph(wiki_id);
+      const graphData = await wikiMgr.graph(wiki_id);
       return Response.json(wrapOk(graphData));
     }
     case "list_raw": {

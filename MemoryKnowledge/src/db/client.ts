@@ -10,6 +10,7 @@ import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import type { Pool } from "pg";
 
 import * as schema from "./schema.js";
 
@@ -37,6 +38,8 @@ export interface KnowledgeDb {
   readonly dialect: Dialect;
   readonly orm: Db;
   readonly tables: KnowledgeTables;
+  /** The node-postgres pool behind `orm` (Postgres only), for raw SQL such as the wiki index. */
+  readonly pgPool?: Pool;
   close(): Promise<void>;
 }
 
