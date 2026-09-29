@@ -109,8 +109,14 @@ export interface ServiceConfig {
   };
   /** Data root directory for knowledge assets (git clones, wiki dirs, SQLite). */
   dataDir: string;
-  /** SQLite database file path. */
+  /** SQLite database file path (used when dbUrl is empty). */
   dbPath: string;
+  /** KNOWLEDGE_DB_URL: `postgres://…` keeps the metadata in Postgres; empty = SQLite at dbPath. */
+  dbUrl: string;
+  /** KNOWLEDGE_DB_SCHEMA: Postgres schema for the metadata tables (empty = connection search_path). */
+  dbSchema: string;
+  /** KNOWLEDGE_DB_POOL_MAX: Postgres pool size. */
+  dbPoolMax: number;
   /** LLM configuration for wiki ingest. */
   llm: LlmConfig;
   /** Log level. */
@@ -213,6 +219,9 @@ export function loadConfig(): ServiceConfig {
     },
     dataDir,
     dbPath,
+    dbUrl: env("KNOWLEDGE_DB_URL", ""),
+    dbSchema: env("KNOWLEDGE_DB_SCHEMA", ""),
+    dbPoolMax: clamp(envInt("KNOWLEDGE_DB_POOL_MAX", 10), 1, 100),
     logLevel: env("LOG_LEVEL", "debug"),
     apiPrefix: env("API_PREFIX", "/v3"),
     publicBaseUrl: env("KNOWLEDGE_PUBLIC_BASE_URL", ""),

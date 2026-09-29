@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { loadConfig } from "./config.js";
-import { createDb } from "./db/client.js";
+import { openKnowledgeDb } from "./db/client.js";
 import { createKnowledgeModule } from "./module.js";
 import { createWikiRoutes } from "./routes/wiki.js";
 import { createCodeGraphRoutes } from "./routes/code-graph.js";
@@ -39,13 +39,18 @@ import { createAnalyticsRoutes } from "./analytics-routes.js";
 
 const log = createLogger("server");
 
-export function createApp() {
+export async function createApp() {
   const config = loadConfig();
   const knowledgeTelemetry = createKnowledgeTelemetry(config.clickhouse);
 
-  // Initialize DB + knowledge module
-  const { db } = createDb({ path: config.dbPath });
-  const knowledgeModule = createKnowledgeModule({
+  // Initialize DB (KNOWLEDGE_DB_URL → Postgres, else SQLite at KNOWLEDGE_DB_PATH) + knowledge module
+  const db = await openKnowledgeDb({
+    url: config.dbUrl,
+    path: config.dbPath,
+    schema: config.dbSchema,
+    poolMax: config.dbPoolMax,
+  });
+  const knowledgeModule = await createKnowledgeModule({
     dataDir: config.dataDir,
     db,
     llmConfig: config.llm,
@@ -134,16 +139,18 @@ export function createApp() {
     log.warn("OpenAPI spec not found at openapi.yaml, skipping Swagger UI");
   }
 
-  return { app, config, knowledgeModule, knowledgeTelemetry };
+  return { app, config, db, knowledgeModule, knowledgeTelemetry };
 }
 
 async function startServer(): Promise<void> {
-  const { app, config, knowledgeTelemetry } = createApp();
+  const { app, config, db, knowledgeModule, knowledgeTelemetry } = await createApp();
   await knowledgeTelemetry.initialize();
 
   log.info(`Starting knowledge service on port ${config.port}`);
   log.info(`Data dir: ${config.dataDir}`);
-  log.info(`DB path: ${config.dbPath}`);
+  log.info(db.dialect === "postgres"
+    ? `DB: postgres${config.dbSchema ? ` (schema ${config.dbSchema})` : ""}`
+    : `DB path: ${config.dbPath}`);
   log.info(`API prefix: ${config.apiPrefix}`);
   log.info(`ClickHouse telemetry: ${config.clickhouse.enabled ? "enabled" : "disabled"}`);
   // Security posture：空 key 只 warn 不拒启（向后兼容），与 Core gateway 的默认开放语义一致。
@@ -166,7 +173,13 @@ async function startServer(): Promise<void> {
     shuttingDown = true;
     log.info(`Received ${signal}, shutting down`);
     await knowledgeTelemetry.shutdown();
-    server.close(() => process.exit(0));
+    knowledgeModule.autoSyncScheduler.stop();
+    server.close(() => {
+      void db
+        .close()
+        .catch((err) => log.warn(`DB close failed: ${err instanceof Error ? err.message : String(err)}`))
+        .finally(() => process.exit(0));
+    });
   };
   process.once("SIGTERM", () => void shutdown("SIGTERM"));
   process.once("SIGINT", () => void shutdown("SIGINT"));

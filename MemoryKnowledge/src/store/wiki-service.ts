@@ -88,7 +88,7 @@ export interface WikiServiceOptions {
   callbackConfig?: {
     tmcCallbackUrl: string;
     /** Per-instance LLM resolver for summary generation (keyed by service_id). */
-    resolveLlm: (serviceId: string) => import("../config.js").LlmConfig;
+    resolveLlm: (serviceId: string) => Promise<import("../config.js").LlmConfig>;
   };
 }
 
@@ -212,7 +212,7 @@ export class WikiService {
   private readonly logger?: WikiServiceLogger;
   private readonly callbackConfig?: {
     tmcCallbackUrl: string;
-    resolveLlm: (serviceId: string) => import("../config.js").LlmConfig;
+    resolveLlm: (serviceId: string) => Promise<import("../config.js").LlmConfig>;
   };
   /**
    * In-flight delete 标记：delete 命中一个正在排队/执行的 wiki 时置位，
@@ -238,8 +238,8 @@ export class WikiService {
    * 创建 wiki 元数据 + 目录壳。**不自动 ingest**。
    * 幂等：同 (service_id, team_id, name) 返回已有行。
    */
-  create(params: CreateWikiParams): { row: WikiRow; existed: boolean } {
-    const { row, existed } = this.store.createWiki(params);
+  async create(params: CreateWikiParams): Promise<{ row: WikiRow; existed: boolean }> {
+    const { row, existed } = await this.store.createWiki(params);
     if (!existed) {
       const dir = this.dirFor(row.service_id, row.team_id, row.wiki_id);
       mkdirSync(join(dir, "raw", "sources"), { recursive: true });
@@ -249,19 +249,23 @@ export class WikiService {
       } catch (err) {
         this.logger?.warn?.(`[wiki] initIndexDb failed for ${row.wiki_id}: ${String(err)}`);
       }
-      this.audit(row, "create", `create wiki ${row.name}`, params.user_id);
+      await this.audit(row, "create", `create wiki ${row.name}`, params.user_id);
     }
     return { row, existed };
   }
 
   /** Persist service_url for a wiki. Returns updated row or null. */
-  updateServiceUrl(serviceId: string, wikiId: string, serviceUrl: string): WikiRow | null {
-    this.store.updateWikiStatus(serviceId, wikiId, { service_url: serviceUrl });
+  async updateServiceUrl(serviceId: string, wikiId: string, serviceUrl: string): Promise<WikiRow | null> {
+    await this.store.updateWikiStatus(serviceId, wikiId, { service_url: serviceUrl });
     return this.store.getWikiById(serviceId, wikiId);
   }
 
   /** Update wiki metadata (name, summary). Returns updated row or null. */
-  updateMeta(serviceId: string, wikiId: string, patch: { name?: string; summary?: string | null }): WikiRow | null {
+  updateMeta(
+    serviceId: string,
+    wikiId: string,
+    patch: { name?: string; summary?: string | null },
+  ): Promise<WikiRow | null> {
     return this.store.updateWikiMeta(serviceId, wikiId, patch);
   }
 
@@ -269,45 +273,45 @@ export class WikiService {
    * 显式触发 ingest（LLM 加工 raw → page + 建索引）。
    * 立即返回，后台异步执行。memory/team 不匹配返回 not_found；pending/processing 返回 busy。
    */
-  ingest(serviceId: string, teamId: string, wikiId: string, requesterUserId?: string): IngestResult {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async ingest(serviceId: string, teamId: string, wikiId: string, requesterUserId?: string): Promise<IngestResult> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return { kind: "not_found" };
     // 并发拒绝：正在排队/执行中直接拒绝，不覆盖状态、不重复入队、不写 audit。
     if (row.status === "pending" || row.status === "processing") {
       return { kind: "busy", status: row.status, step: row.internal_status };
     }
     const nextVersion = row.version + 1;
-    this.store.updateWikiStatus(serviceId, wikiId, {
+    await this.store.updateWikiStatus(serviceId, wikiId, {
       status: "pending",
       internal_status: null,
       sync_error: null,
       version: nextVersion,
     });
-    this.audit({ ...row, version: nextVersion }, "ingest", "manual ingest", requesterUserId);
-    const fresh = this.store.getWiki(serviceId, teamId, wikiId);
+    await this.audit({ ...row, version: nextVersion }, "ingest", "manual ingest", requesterUserId);
+    const fresh = await this.store.getWiki(serviceId, teamId, wikiId);
     if (fresh) this.enqueueBuild(fresh);
     return fresh ? { kind: "ok", row: fresh } : { kind: "not_found" };
   }
 
   /** sync 语义 = 重跑 ingest（管控显式触发）。 */
-  sync(serviceId: string, teamId: string, wikiId: string, requesterUserId?: string): IngestResult {
+  sync(serviceId: string, teamId: string, wikiId: string, requesterUserId?: string): Promise<IngestResult> {
     return this.ingest(serviceId, teamId, wikiId, requesterUserId);
   }
 
-  get(serviceId: string, teamId: string, wikiId: string): WikiRow | null {
+  get(serviceId: string, teamId: string, wikiId: string): Promise<WikiRow | null> {
     return this.store.getWiki(serviceId, teamId, wikiId);
   }
 
   /** 按全局唯一 wiki_id 查询（仍按 service_id 收敛防跨租户）。spec id-only 端点专用。 */
-  getById(serviceId: string, wikiId: string): WikiRow | null {
+  getById(serviceId: string, wikiId: string): Promise<WikiRow | null> {
     return this.store.getWikiById(serviceId, wikiId);
   }
 
-  list(serviceId: string, teamId: string, opts?: ListOpts): WikiRow[] {
+  list(serviceId: string, teamId: string, opts?: ListOpts): Promise<WikiRow[]> {
     return this.store.listWikis(serviceId, teamId, opts);
   }
 
-  count(serviceId: string, teamId: string, opts?: CountOpts): number {
+  count(serviceId: string, teamId: string, opts?: CountOpts): Promise<number> {
     return this.store.countWikis(serviceId, teamId, opts);
   }
 
@@ -319,16 +323,16 @@ export class WikiService {
    * 硬删 + 清理（不等 worker）。worker 结束前重查发现已删则跳过 ready/回调并再做
    * 一次幂等清理，无残留。
    */
-  delete(serviceId: string, teamId: string, wikiId: string): boolean {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async delete(serviceId: string, teamId: string, wikiId: string): Promise<boolean> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return false;
 
     if (row.status === "pending" || row.status === "processing") {
       this.cancelled.add(wikiId);
     }
 
-    this.audit(row, "delete", null);
-    this.cleanupResources(serviceId, teamId, wikiId);
+    await this.audit(row, "delete", null);
+    await this.cleanupResources(serviceId, teamId, wikiId);
     // 不在此删 cancelled 标记（覆盖 delete 先于 worker 检查点的窗口）；
     // worker 结束时由 finishCancelled 移除。cleanup 幂等，重复无害。
     return true;
@@ -341,14 +345,14 @@ export class WikiService {
    *   3. 磁盘目录（wiki/ raw/ index.db 及 -wal/-shm）：rmSync recursive+force（幂等）
    * BuildQueue 排队任务由 runBuild 入口检查 cancelled/行存在性跳过，无需在此处理。
    */
-  private cleanupResources(serviceId: string, teamId: string, wikiId: string): void {
+  private async cleanupResources(serviceId: string, teamId: string, wikiId: string): Promise<void> {
     try {
       evictWikiDb(wikiId);
     } catch (err) {
       this.logger?.warn?.(`[wiki] evict index.db failed ${wikiId}: ${String(err)}`);
     }
     try {
-      this.store.deleteWiki(serviceId, teamId, wikiId);
+      await this.store.deleteWiki(serviceId, teamId, wikiId);
     } catch (err) {
       this.logger?.warn?.(`[wiki] hard-delete row failed ${wikiId}: ${String(err)}`);
     }
@@ -363,24 +367,29 @@ export class WikiService {
    * worker 检查点：wiki 是否已被删除（cancelled 标记命中，或行已不在库）。
    * 双判据覆盖 delete-during-run 与 delete-already-done 两种时序。
    */
-  private isDeleted(serviceId: string, wikiId: string): boolean {
-    return this.cancelled.has(wikiId) || this.store.getWikiById(serviceId, wikiId) === null;
+  private async isDeleted(serviceId: string, wikiId: string): Promise<boolean> {
+    return this.cancelled.has(wikiId) || (await this.store.getWikiById(serviceId, wikiId)) === null;
   }
 
   /**
    * worker 检查点判定“已删”后的收尾：幂等清理 worker 可能刚写下的盘/连接，
    * 并移除 cancelled 标记。
    */
-  private finishCancelled(serviceId: string, teamId: string, wikiId: string): void {
-    this.cleanupResources(serviceId, teamId, wikiId);
+  private async finishCancelled(serviceId: string, teamId: string, wikiId: string): Promise<void> {
+    await this.cleanupResources(serviceId, teamId, wikiId);
     this.cancelled.delete(wikiId);
     this.logger?.info?.(`[wiki] ${wikiId} build aborted (deleted during processing)`);
   }
 
   /** 写一条 wiki 审计记录。失败不阻断主流程。 */
-  private audit(row: WikiRow, action: AuditAction, detail: string | null, requesterUserId?: string): void {
+  private async audit(
+    row: WikiRow,
+    action: AuditAction,
+    detail: string | null,
+    requesterUserId?: string,
+  ): Promise<void> {
     try {
-      this.store.appendWikiAudit({
+      await this.store.appendWikiAudit({
         service_id: row.service_id,
         asset_id: row.wiki_id,
         version: row.version,
@@ -400,8 +409,8 @@ export class WikiService {
   // ═══════════════════════════════════════════════════════════════════
 
   /** 列出 raw/sources/ 下的素材文件（改查 source 表，设计 003 §3.5）。wiki 不存在返回 null。 */
-  rawLs(serviceId: string, teamId: string, wikiId: string): RawFileEntry[] | null {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async rawLs(serviceId: string, teamId: string, wikiId: string): Promise<RawFileEntry[] | null> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     const dir = this.dirFor(serviceId, teamId, wikiId);
     try {
@@ -423,8 +432,8 @@ export class WikiService {
   }
 
   /** 读单个 raw 文件原文。文件不存在返回 null（含 wiki 不存在）。 */
-  rawRead(serviceId: string, teamId: string, wikiId: string, filename: string): string | null {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async rawRead(serviceId: string, teamId: string, wikiId: string, filename: string): Promise<string | null> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     const sourcesDir = join(this.dirFor(serviceId, teamId, wikiId), "raw", "sources");
     const safe = this.resolveRawPath(sourcesDir, filename);
@@ -443,13 +452,13 @@ export class WikiService {
    * - 超 RAW_READ_MAX → 抛错（router 转 400）
    * 单个文件不存在不报错，对应 item 标 not_found:true（spec：整体仍 200）。
    */
-  rawReadMany(
+  async rawReadMany(
     serviceId: string,
     teamId: string,
     wikiId: string,
     filenames: string[],
-  ): WriteOutcome<RawReadItem[]> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<RawReadItem[]>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (filenames.length > RAW_READ_MAX) {
       throw new Error(`filenames exceeds max ${RAW_READ_MAX}`);
@@ -482,15 +491,15 @@ export class WikiService {
    * - 路径穿越 → "invalid_path"
    * - 超 5MB → "too_large"
    */
-  rawWrite(
+  async rawWrite(
     serviceId: string,
     teamId: string,
     wikiId: string,
     filename: string,
     content: string,
     userId?: string,
-  ): WriteOutcome<RawWriteResult> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<RawWriteResult>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status === "processing") return "processing";
 
@@ -514,14 +523,14 @@ export class WikiService {
    *   的文件），保证整批要么都成功要么都没生效。
    * 错误码同 rawWrite。
    */
-  rawWriteMany(
+  async rawWriteMany(
     serviceId: string,
     teamId: string,
     wikiId: string,
     files: { filename: string; content: string }[],
     userId?: string,
-  ): WriteOutcome<RawWriteManyItem[]> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<RawWriteManyItem[]>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status === "processing") return "processing";
     if (files.length > RAW_WRITE_MAX) {
@@ -600,7 +609,7 @@ export class WikiService {
     wikiId: string,
     filenames: string[],
   ): Promise<WriteOutcome<RawRmResult>> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status === "processing") return "processing";
     if (filenames.length > RAW_RM_MAX) {
@@ -649,8 +658,12 @@ export class WikiService {
    * 列出 wiki/ 下的 page 文件（recursive 扫描 .md 取 frontmatter）。
    * status≠ready 时返回空数组。
    */
-  pageLs(serviceId: string, teamId: string, wikiId: string): { id: string; title: string; type: string; path: string; description?: string; locked?: boolean }[] | null {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async pageLs(
+    serviceId: string,
+    teamId: string,
+    wikiId: string,
+  ): Promise<{ id: string; title: string; type: string; path: string; description?: string; locked?: boolean }[] | null> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status !== "ready") return [];
 
@@ -664,8 +677,8 @@ export class WikiService {
   }
 
   /** 读单个 page 原文。ref 可以是 page id 或 relPath。 */
-  pageRead(serviceId: string, teamId: string, wikiId: string, ref: string): string | null {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  async pageRead(serviceId: string, teamId: string, wikiId: string, ref: string): Promise<string | null> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
 
     const projectPath = this.dirFor(serviceId, teamId, wikiId);
@@ -685,13 +698,13 @@ export class WikiService {
    * - 超 PAGE_READ_MAX → 抛错
    * 单个 ref 不存在不报错，对应 item 标 not_found:true（spec：整体仍 200）。
    */
-  pageReadMany(
+  async pageReadMany(
     serviceId: string,
     teamId: string,
     wikiId: string,
     refs: string[],
-  ): WriteOutcome<PageReadItem[]> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<PageReadItem[]>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (refs.length > PAGE_READ_MAX) {
       throw new Error(`refs exceeds max ${PAGE_READ_MAX}`);
@@ -726,14 +739,14 @@ export class WikiService {
    * - 结构性文件 → "forbidden_path"
    * - 超 512KB → "too_large"
    */
-  pageWrite(
+  async pageWrite(
     serviceId: string,
     teamId: string,
     wikiId: string,
     ref: string,
     content: string,
-  ): WriteOutcome<PageWriteResult> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<PageWriteResult>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status === "processing") return "processing";
 
@@ -759,13 +772,13 @@ export class WikiService {
    *   结构性文件 → "forbidden_path"；超 512KB → "too_large"
    * - 全部通过后逐文件落盘；任一失败回滚已写文件。
    */
-  pageWriteMany(
+  async pageWriteMany(
     serviceId: string,
     teamId: string,
     wikiId: string,
     pages: { ref: string; content: string }[],
-  ): WriteOutcome<PageWriteManyItem[]> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+  ): Promise<WriteOutcome<PageWriteManyItem[]>> {
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status === "processing") return "processing";
     if (pages.length > PAGE_WRITE_MAX) {
@@ -837,7 +850,7 @@ export class WikiService {
     wikiId: string,
     refs: string[],
   ): Promise<WriteOutcome<PageRmResult>> {
-    const row = this.store.getWiki(serviceId, teamId, wikiId);
+    const row = await this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return null;
     if (row.status === "processing") return "processing";
     if (refs.length > PAGE_RM_MAX) {
@@ -1013,17 +1026,18 @@ export class WikiService {
 
   private async runBuild(serviceId: string, wikiId: string, teamId: string, name: string): Promise<void> {
     // 入口检查点：pending 期间被删 → 跳过，不置 processing、不 ingest。
-    if (this.isDeleted(serviceId, wikiId)) {
-      this.finishCancelled(serviceId, teamId, wikiId);
+    if (await this.isDeleted(serviceId, wikiId)) {
+      await this.finishCancelled(serviceId, teamId, wikiId);
       return;
     }
-    this.store.updateWikiStatus(serviceId, wikiId, {
+    await this.store.updateWikiStatus(serviceId, wikiId, {
       status: "processing",
       internal_status: "scanning",
       sync_error: null,
     });
     // 进度/终态 callback 共用同一代际，Panel 可拒绝 clear 后的迟到 progress
     const ingestRunId = randomUUID();
+    let statusWrites: Promise<void> = Promise.resolve();
     try {
       const result = await this.worker({
         wikiId,
@@ -1031,44 +1045,50 @@ export class WikiService {
         teamId,
         name,
         dir: this.dirFor(serviceId, teamId, wikiId),
-        setInternalStatus: (s) =>
-          this.store.updateWikiStatus(serviceId, wikiId, { status: "processing", internal_status: s }),
+        setInternalStatus: (s) => {
+          // Workers call this synchronously; chain the writes so they land in order and before the final status.
+          statusWrites = statusWrites
+            .then(() => this.store.updateWikiStatus(serviceId, wikiId, { status: "processing", internal_status: s }))
+            .catch((err) => this.logger?.warn?.(`[wiki] internal status ${s} failed ${wikiId}: ${String(err)}`));
+        },
         ingestRunId,
       });
+      await statusWrites;
       // 结束前检查点：processing 期间被删 → 跳过 ready/audit/回调，幂等收尾清理。
-      if (this.isDeleted(serviceId, wikiId)) {
-        this.finishCancelled(serviceId, teamId, wikiId);
+      if (await this.isDeleted(serviceId, wikiId)) {
+        await this.finishCancelled(serviceId, teamId, wikiId);
         return;
       }
-      this.store.updateWikiStatus(serviceId, wikiId, {
+      await this.store.updateWikiStatus(serviceId, wikiId, {
         status: "ready",
         internal_status: null,
         sync_error: null,
         page_count: result?.pageCount ?? null,
         last_sync_at: new Date().toISOString(),
       });
-      const synced = this.store.getWikiById(serviceId, wikiId);
+      const synced = await this.store.getWikiById(serviceId, wikiId);
       if (synced) {
-        this.audit(synced, "ready", result?.pageCount != null ? `pages: ${result.pageCount}` : null);
+        await this.audit(synced, "ready", result?.pageCount != null ? `pages: ${result.pageCount}` : null);
       }
       this.logger?.info?.(`[wiki] ${wikiId} ready (pages: ${result?.pageCount ?? '?'})`);
 
       // Auto-generate summary + callback TMC
       await this.onBuildComplete(synced, "ready", null, ingestRunId);
     } catch (err) {
+      await statusWrites;
       const msg = err instanceof Error ? err.message : String(err);
       // worker 抛错，但若期间已被删，视为取消而非失败：跳过 failed 状态/回调，做清理。
-      if (this.isDeleted(serviceId, wikiId)) {
-        this.finishCancelled(serviceId, teamId, wikiId);
+      if (await this.isDeleted(serviceId, wikiId)) {
+        await this.finishCancelled(serviceId, teamId, wikiId);
         return;
       }
-      this.store.updateWikiStatus(serviceId, wikiId, {
+      await this.store.updateWikiStatus(serviceId, wikiId, {
         status: "failed",
         internal_status: null,
         sync_error: msg.slice(0, 500),
       });
-      const failed = this.store.getWikiById(serviceId, wikiId);
-      if (failed) this.audit(failed, "failed", msg.slice(0, 500));
+      const failed = await this.store.getWikiById(serviceId, wikiId);
+      if (failed) await this.audit(failed, "failed", msg.slice(0, 500));
       this.logger?.warn?.(`[wiki] ${wikiId} failed: ${msg}`);
 
       // Callback TMC about failure
@@ -1093,18 +1113,18 @@ export class WikiService {
     if (status === "ready") {
       // Generate summary via LLM (即使部分源失败也尝试生成——只要有页面就生成)
       try {
-        const pages = this.pageLs(row.service_id, row.team_id, row.wiki_id) ?? [];
+        const pages = (await this.pageLs(row.service_id, row.team_id, row.wiki_id)) ?? [];
         this.logger?.info?.(`[wiki] summary generation start (wikiId=${row.wiki_id}, pages=${pages.length}, status=${status})`);
         const { generateWikiSummary } = await import("../callback.js");
         summary = await generateWikiSummary(
           row.wiki_id,
           row.name,
           pages.map((p) => ({ title: p.title, description: p.description })),
-          this.callbackConfig.resolveLlm(row.service_id),
+          await this.callbackConfig.resolveLlm(row.service_id),
         );
         this.logger?.info?.(`[wiki] summary generation done (wikiId=${row.wiki_id}, len=${summary?.length ?? 0}, empty=${!summary})`);
         if (summary) {
-          this.store.updateWikiStatus(row.service_id, row.wiki_id, { summary });
+          await this.store.updateWikiStatus(row.service_id, row.wiki_id, { summary });
         }
       } catch (err) {
         this.logger?.warn?.(`[wiki] summary generation failed: ${String(err)}`);

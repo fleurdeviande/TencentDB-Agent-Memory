@@ -1,7 +1,7 @@
 import { Hono } from "hono";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createDb } from "../db/client.js";
+import { createTestDb, type TestDb } from "../test-utils/db.js";
 import { createGitCredentialStore, type IGitCredentialStore } from "../store/index.js";
 import { createSourceCredentialRoutes, type SourceCredentialRouteDeps } from "./source-credential.js";
 
@@ -13,9 +13,9 @@ const TOKEN = "ghp_TESTTOKEN1234567890";
 let app: Hono;
 let credentialStore: IGitCredentialStore;
 let deps: SourceCredentialRouteDeps;
+let db: TestDb;
 
 function buildApp(overrides: Partial<SourceCredentialRouteDeps> = {}) {
-  const { db } = createDb({ path: ":memory:" });
   credentialStore = createGitCredentialStore({ db, secretKey: SECRET_KEY });
   deps = {
     credentialStore,
@@ -54,8 +54,13 @@ async function createCredential(overrides: Record<string, unknown> = {}) {
   return { res, body: await json(res) };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  db = await createTestDb();
   app = buildApp();
+});
+
+afterEach(async () => {
+  await db.dispose();
 });
 
 describe("POST /create", () => {

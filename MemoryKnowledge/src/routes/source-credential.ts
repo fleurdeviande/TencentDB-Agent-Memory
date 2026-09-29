@@ -167,7 +167,7 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
 
     const credentialId = genGitCredentialId();
     try {
-      const row = credentialStore.create({
+      const row = await credentialStore.create({
         credential_id: credentialId,
         service_id: idFields.service_id,
         team_id: idFields.team_id,
@@ -180,7 +180,7 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
       });
 
       // 审计只记 host，绝不记密钥。
-      credentialStore.appendAudit({
+      await credentialStore.appendAudit({
         service_id: idFields.service_id,
         credential_id: credentialId,
         action: "create",
@@ -207,9 +207,7 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
       return c.json(wrapError(400, "x-tdai-service-id header and team_id are required"), 400);
     }
 
-    const items = credentialStore
-      .list(idFields.service_id, idFields.team_id)
-      .map(toSourceCredentialDetail);
+    const items = (await credentialStore.list(idFields.service_id, idFields.team_id)).map(toSourceCredentialDetail);
     return c.json(wrapOk({ items, total: items.length }));
   });
 
@@ -226,7 +224,7 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
     }
 
     // 带 team 收敛：同一个 service 的另一个 team 读不到。
-    const row = credentialStore.get(idFields.service_id, idFields.team_id, credentialId);
+    const row = await credentialStore.get(idFields.service_id, idFields.team_id, credentialId);
     if (!row) return c.json(wrapError(404, "source credential not found"), 404);
 
     return c.json(wrapOk(toSourceCredentialDetail(row)));
@@ -257,12 +255,12 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
       valid.push(id);
     }
 
-    const deleted = credentialStore.delete(idFields.service_id, idFields.team_id, valid);
+    const deleted = await credentialStore.delete(idFields.service_id, idFields.team_id, valid);
     result.deleted_ids.push(...deleted.deleted_ids);
     result.failed.push(...deleted.failed);
 
     for (const id of deleted.deleted_ids) {
-      credentialStore.appendAudit({
+      await credentialStore.appendAudit({
         service_id: idFields.service_id,
         credential_id: id,
         action: "delete",
@@ -297,7 +295,7 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
     if (!repoUrl) return c.json(wrapError(400, "repo_url is required"), 400);
     const branch = typeof body.branch === "string" && body.branch ? body.branch : undefined;
 
-    const row = credentialStore.get(idFields.service_id, idFields.team_id, credentialId);
+    const row = await credentialStore.get(idFields.service_id, idFields.team_id, credentialId);
     if (!row) return c.json(wrapError(404, "source credential not found"), 404);
 
     const parsed = parseGitUrl(repoUrl);
@@ -344,7 +342,7 @@ export function createSourceCredentialRoutes(deps: SourceCredentialRouteDeps): H
       result = { ok: false, error: stripUserInfo(errorMessage(err)) };
     }
 
-    credentialStore.appendAudit({
+    await credentialStore.appendAudit({
       service_id: idFields.service_id,
       credential_id: credentialId,
       action: "test",

@@ -1,5 +1,5 @@
 /**
- * SqliteKnowledgeStore — SQLite/Drizzle implementation of IKnowledgeStore.
+ * SqliteKnowledgeStore — Drizzle implementation of IKnowledgeStore (SQLite or Postgres; the name is upstream's).
  *
  * Responsibilities:
  *   - code-graph / wiki asset CRUD (hard delete; soft-delete markers via deleted_at)
@@ -14,14 +14,19 @@
  */
 
 import { eq, and, isNull, desc, sql, type SQL } from "drizzle-orm";
-import type { Db } from "../db/client.js";
 import {
-  knowledgeCodeGraph,
-  knowledgeWiki,
-  knowledgeWikiAudit,
-  knowledgeCodeGraphAudit,
+  affectedRows,
+  asKnowledgeDb,
+  isUniqueViolation,
+  type Db,
+  type KnowledgeDb,
+  type KnowledgeTables,
+} from "../db/client.js";
+import {
   CODE_DATA_VERSION,
   WIKI_DATA_VERSION,
+  type KnowledgeCodeGraph,
+  type KnowledgeWiki,
 } from "../db/schema.js";
 import { genCodeGraphId, genWikiId } from "./ids.js";
 import type {
@@ -50,15 +55,18 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function isUniqueViolation(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /UNIQUE constraint failed|SQLITE_CONSTRAINT/i.test(msg);
-}
-
 // ───────────────────────── Store ─────────────────────────
 
 export class SqliteKnowledgeStore implements IKnowledgeStore {
-  constructor(private readonly db: Db) {}
+  private readonly db: Db;
+  private readonly t: KnowledgeTables;
+
+  /** Upstream passes the SQLite `Db`; a `KnowledgeDb` selects the dialect (SQLite or Postgres). */
+  constructor(db: Db | KnowledgeDb) {
+    const kdb = asKnowledgeDb(db);
+    this.db = kdb.orm;
+    this.t = kdb.tables;
+  }
 
   // ═══════════════════════ Code-Graph ═══════════════════════
 
@@ -66,28 +74,28 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
    * Idempotent create: hit (service_id, team_id, repo_url, branch) returns existing
    * (existed=true); otherwise generate cg- id and insert (PK conflict auto-retry).
    */
-  createCodeGraph(input: CreateCodeGraphInput): CreateResult<CodeGraphRow> {
-    const existing = this.db
+  async createCodeGraph(input: CreateCodeGraphInput): Promise<CreateResult<CodeGraphRow>> {
+    const [existing] = await this.db
       .select()
-      .from(knowledgeCodeGraph)
+      .from(this.t.knowledgeCodeGraph)
       .where(
         and(
-          eq(knowledgeCodeGraph.serviceId, input.service_id),
-          eq(knowledgeCodeGraph.teamId, input.team_id),
-          eq(knowledgeCodeGraph.repoUrl, input.repo_url),
-          eq(knowledgeCodeGraph.branch, input.branch),
-          isNull(knowledgeCodeGraph.deletedAt),
+          eq(this.t.knowledgeCodeGraph.serviceId, input.service_id),
+          eq(this.t.knowledgeCodeGraph.teamId, input.team_id),
+          eq(this.t.knowledgeCodeGraph.repoUrl, input.repo_url),
+          eq(this.t.knowledgeCodeGraph.branch, input.branch),
+          isNull(this.t.knowledgeCodeGraph.deletedAt),
         ),
       )
-      .get();
+      .limit(1);
     if (existing) return { row: this.mapCgRow(existing), existed: true };
 
     const ts = nowIso();
     for (let attempt = 0; attempt < ID_RETRY; attempt++) {
       const id = genCodeGraphId();
       try {
-        this.db
-          .insert(knowledgeCodeGraph)
+        await this.db
+          .insert(this.t.knowledgeCodeGraph)
           .values({
             codeGraphId: id,
             serviceId: input.service_id,
@@ -106,30 +114,29 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
             version: CODE_DATA_VERSION,
             createdAt: ts,
             updatedAt: ts,
-          })
-          .run();
+          });
 
-        const row = this.db
+        const [row] = await this.db
           .select()
-          .from(knowledgeCodeGraph)
-          .where(eq(knowledgeCodeGraph.codeGraphId, id))
-          .get();
+          .from(this.t.knowledgeCodeGraph)
+          .where(eq(this.t.knowledgeCodeGraph.codeGraphId, id))
+          .limit(1);
         return { row: this.mapCgRow(row!), existed: false };
       } catch (err) {
         // PK conflict → retry with new id; unique(memory,team,repo,branch) conflict → race, return existing
-        const raced = this.db
+        const [raced] = await this.db
           .select()
-          .from(knowledgeCodeGraph)
+          .from(this.t.knowledgeCodeGraph)
           .where(
             and(
-              eq(knowledgeCodeGraph.serviceId, input.service_id),
-              eq(knowledgeCodeGraph.teamId, input.team_id),
-              eq(knowledgeCodeGraph.repoUrl, input.repo_url),
-              eq(knowledgeCodeGraph.branch, input.branch),
-              isNull(knowledgeCodeGraph.deletedAt),
+              eq(this.t.knowledgeCodeGraph.serviceId, input.service_id),
+              eq(this.t.knowledgeCodeGraph.teamId, input.team_id),
+              eq(this.t.knowledgeCodeGraph.repoUrl, input.repo_url),
+              eq(this.t.knowledgeCodeGraph.branch, input.branch),
+              isNull(this.t.knowledgeCodeGraph.deletedAt),
             ),
           )
-          .get();
+          .limit(1);
         if (raced) return { row: this.mapCgRow(raced), existed: true };
         if (!isUniqueViolation(err) || attempt === ID_RETRY - 1) throw err;
       }
@@ -137,73 +144,72 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
     throw new Error("createCodeGraph: failed to allocate unique id");
   }
 
-  getCodeGraph(serviceId: string, teamId: string, codeGraphId: string): CodeGraphRow | null {
-    const row = this.db
+  async getCodeGraph(serviceId: string, teamId: string, codeGraphId: string): Promise<CodeGraphRow | null> {
+    const [row] = await this.db
       .select()
-      .from(knowledgeCodeGraph)
+      .from(this.t.knowledgeCodeGraph)
       .where(
         and(
-          eq(knowledgeCodeGraph.codeGraphId, codeGraphId),
-          eq(knowledgeCodeGraph.serviceId, serviceId),
-          eq(knowledgeCodeGraph.teamId, teamId),
+          eq(this.t.knowledgeCodeGraph.codeGraphId, codeGraphId),
+          eq(this.t.knowledgeCodeGraph.serviceId, serviceId),
+          eq(this.t.knowledgeCodeGraph.teamId, teamId),
         ),
       )
-      .get();
+      .limit(1);
     return row ? this.mapCgRow(row) : null;
   }
 
   /** id-only accessor — STILL scoped by service_id (cross-Memory leak guard, 001 §2.4). */
-  getCodeGraphById(serviceId: string, codeGraphId: string): CodeGraphRow | null {
-    const row = this.db
+  async getCodeGraphById(serviceId: string, codeGraphId: string): Promise<CodeGraphRow | null> {
+    const [row] = await this.db
       .select()
-      .from(knowledgeCodeGraph)
+      .from(this.t.knowledgeCodeGraph)
       .where(
         and(
-          eq(knowledgeCodeGraph.codeGraphId, codeGraphId),
-          eq(knowledgeCodeGraph.serviceId, serviceId),
+          eq(this.t.knowledgeCodeGraph.codeGraphId, codeGraphId),
+          eq(this.t.knowledgeCodeGraph.serviceId, serviceId),
         ),
       )
-      .get();
+      .limit(1);
     return row ? this.mapCgRow(row) : null;
   }
 
-  listCodeGraphs(serviceId: string, teamId: string, opts?: ListOpts): CodeGraphRow[] {
+  async listCodeGraphs(serviceId: string, teamId: string, opts?: ListOpts): Promise<CodeGraphRow[]> {
     const conditions: SQL[] = [
-      eq(knowledgeCodeGraph.serviceId, serviceId),
-      eq(knowledgeCodeGraph.teamId, teamId),
+      eq(this.t.knowledgeCodeGraph.serviceId, serviceId),
+      eq(this.t.knowledgeCodeGraph.teamId, teamId),
     ];
     if (opts?.syncStatus) {
-      conditions.push(eq(knowledgeCodeGraph.status, opts.syncStatus));
+      conditions.push(eq(this.t.knowledgeCodeGraph.status, opts.syncStatus));
     }
-    const rows = this.db
+    const rows = await this.db
       .select()
-      .from(knowledgeCodeGraph)
+      .from(this.t.knowledgeCodeGraph)
       .where(and(...conditions))
-      .orderBy(desc(knowledgeCodeGraph.updatedAt))
+      .orderBy(desc(this.t.knowledgeCodeGraph.updatedAt))
       .limit(opts?.limit ?? 20)
-      .offset(opts?.offset ?? 0)
-      .all();
+      .offset(opts?.offset ?? 0);
     return rows.map((r) => this.mapCgRow(r));
   }
 
-  countCodeGraphs(serviceId: string, teamId: string, opts?: CountOpts): number {
+  async countCodeGraphs(serviceId: string, teamId: string, opts?: CountOpts): Promise<number> {
     const conditions: SQL[] = [
-      eq(knowledgeCodeGraph.serviceId, serviceId),
-      eq(knowledgeCodeGraph.teamId, teamId),
+      eq(this.t.knowledgeCodeGraph.serviceId, serviceId),
+      eq(this.t.knowledgeCodeGraph.teamId, teamId),
     ];
     if (opts?.syncStatus) {
-      conditions.push(eq(knowledgeCodeGraph.status, opts.syncStatus));
+      conditions.push(eq(this.t.knowledgeCodeGraph.status, opts.syncStatus));
     }
-    const result = this.db
-      .select({ total: sql<number>`count(*)` })
-      .from(knowledgeCodeGraph)
+    const [result] = await this.db
+      .select({ total: sql<number>`count(*)`.mapWith(Number) })
+      .from(this.t.knowledgeCodeGraph)
       .where(and(...conditions))
-      .get();
+      .limit(1);
     return result?.total ?? 0;
   }
 
   /** id-only mutation — scoped by service_id so a foreign tenant cannot mutate. */
-  updateCodeGraphStatus(serviceId: string, codeGraphId: string, patch: CodeGraphStatusPatch): void {
+  async updateCodeGraphStatus(serviceId: string, codeGraphId: string, patch: CodeGraphStatusPatch): Promise<void> {
     const set: Record<string, unknown> = { updatedAt: nowIso() };
     if (patch.status !== undefined) set.status = patch.status;
     if (patch.internal_status !== undefined) set.internalStatus = patch.internal_status;
@@ -215,75 +221,76 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
     if (patch.summary !== undefined) set.summary = patch.summary;
     if (patch.version !== undefined) set.version = patch.version;
 
-    this.db
-      .update(knowledgeCodeGraph)
+    await this.db
+      .update(this.t.knowledgeCodeGraph)
       .set(set)
       .where(
         and(
-          eq(knowledgeCodeGraph.codeGraphId, codeGraphId),
-          eq(knowledgeCodeGraph.serviceId, serviceId),
+          eq(this.t.knowledgeCodeGraph.codeGraphId, codeGraphId),
+          eq(this.t.knowledgeCodeGraph.serviceId, serviceId),
         ),
-      )
-      .run();
+      );
   }
 
   /** Hard delete; memory/team mismatch returns false. */
-  deleteCodeGraph(serviceId: string, teamId: string, codeGraphId: string): boolean {
-    const result = this.db
-      .delete(knowledgeCodeGraph)
+  async deleteCodeGraph(serviceId: string, teamId: string, codeGraphId: string): Promise<boolean> {
+    const result = await this.db
+      .delete(this.t.knowledgeCodeGraph)
       .where(
         and(
-          eq(knowledgeCodeGraph.codeGraphId, codeGraphId),
-          eq(knowledgeCodeGraph.serviceId, serviceId),
-          eq(knowledgeCodeGraph.teamId, teamId),
+          eq(this.t.knowledgeCodeGraph.codeGraphId, codeGraphId),
+          eq(this.t.knowledgeCodeGraph.serviceId, serviceId),
+          eq(this.t.knowledgeCodeGraph.teamId, teamId),
         ),
-      )
-      .run();
-    return result.changes > 0;
+      );
+    return affectedRows(result) > 0;
   }
 
   /** Update code-graph metadata (repo_name, summary, credential_id). memory mismatch → null. */
-  updateCodeGraphMeta(serviceId: string, codeGraphId: string, patch: CodeGraphMetaPatch): CodeGraphRow | null {
+  async updateCodeGraphMeta(
+    serviceId: string,
+    codeGraphId: string,
+    patch: CodeGraphMetaPatch,
+  ): Promise<CodeGraphRow | null> {
     const set: Record<string, unknown> = { updatedAt: nowIso() };
     if (patch.repo_name !== undefined) set.repoName = patch.repo_name;
     if (patch.summary !== undefined) set.summary = patch.summary;
     if (patch.credential_id !== undefined) set.credentialId = patch.credential_id;
-    this.db
-      .update(knowledgeCodeGraph)
+    await this.db
+      .update(this.t.knowledgeCodeGraph)
       .set(set)
       .where(
         and(
-          eq(knowledgeCodeGraph.codeGraphId, codeGraphId),
-          eq(knowledgeCodeGraph.serviceId, serviceId),
+          eq(this.t.knowledgeCodeGraph.codeGraphId, codeGraphId),
+          eq(this.t.knowledgeCodeGraph.serviceId, serviceId),
         ),
-      )
-      .run();
+      );
     return this.getCodeGraphById(serviceId, codeGraphId);
   }
 
   // ═══════════════════════ Wiki ═══════════════════════
 
-  createWiki(input: CreateWikiInput): CreateResult<WikiRow> {
-    const existing = this.db
+  async createWiki(input: CreateWikiInput): Promise<CreateResult<WikiRow>> {
+    const [existing] = await this.db
       .select()
-      .from(knowledgeWiki)
+      .from(this.t.knowledgeWiki)
       .where(
         and(
-          eq(knowledgeWiki.serviceId, input.service_id),
-          eq(knowledgeWiki.teamId, input.team_id),
-          eq(knowledgeWiki.name, input.name),
-          isNull(knowledgeWiki.deletedAt),
+          eq(this.t.knowledgeWiki.serviceId, input.service_id),
+          eq(this.t.knowledgeWiki.teamId, input.team_id),
+          eq(this.t.knowledgeWiki.name, input.name),
+          isNull(this.t.knowledgeWiki.deletedAt),
         ),
       )
-      .get();
+      .limit(1);
     if (existing) return { row: this.mapWikiRow(existing), existed: true };
 
     const ts = nowIso();
     for (let attempt = 0; attempt < ID_RETRY; attempt++) {
       const id = genWikiId();
       try {
-        this.db
-          .insert(knowledgeWiki)
+        await this.db
+          .insert(this.t.knowledgeWiki)
           .values({
             wikiId: id,
             serviceId: input.service_id,
@@ -301,28 +308,27 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
             version: WIKI_DATA_VERSION,
             createdAt: ts,
             updatedAt: ts,
-          })
-          .run();
+          });
 
-        const row = this.db
+        const [row] = await this.db
           .select()
-          .from(knowledgeWiki)
-          .where(eq(knowledgeWiki.wikiId, id))
-          .get();
+          .from(this.t.knowledgeWiki)
+          .where(eq(this.t.knowledgeWiki.wikiId, id))
+          .limit(1);
         return { row: this.mapWikiRow(row!), existed: false };
       } catch (err) {
-        const raced = this.db
+        const [raced] = await this.db
           .select()
-          .from(knowledgeWiki)
+          .from(this.t.knowledgeWiki)
           .where(
             and(
-              eq(knowledgeWiki.serviceId, input.service_id),
-              eq(knowledgeWiki.teamId, input.team_id),
-              eq(knowledgeWiki.name, input.name),
-              isNull(knowledgeWiki.deletedAt),
+              eq(this.t.knowledgeWiki.serviceId, input.service_id),
+              eq(this.t.knowledgeWiki.teamId, input.team_id),
+              eq(this.t.knowledgeWiki.name, input.name),
+              isNull(this.t.knowledgeWiki.deletedAt),
             ),
           )
-          .get();
+          .limit(1);
         if (raced) return { row: this.mapWikiRow(raced), existed: true };
         if (!isUniqueViolation(err) || attempt === ID_RETRY - 1) throw err;
       }
@@ -330,73 +336,72 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
     throw new Error("createWiki: failed to allocate unique id");
   }
 
-  getWiki(serviceId: string, teamId: string, wikiId: string): WikiRow | null {
-    const row = this.db
+  async getWiki(serviceId: string, teamId: string, wikiId: string): Promise<WikiRow | null> {
+    const [row] = await this.db
       .select()
-      .from(knowledgeWiki)
+      .from(this.t.knowledgeWiki)
       .where(
         and(
-          eq(knowledgeWiki.wikiId, wikiId),
-          eq(knowledgeWiki.serviceId, serviceId),
-          eq(knowledgeWiki.teamId, teamId),
+          eq(this.t.knowledgeWiki.wikiId, wikiId),
+          eq(this.t.knowledgeWiki.serviceId, serviceId),
+          eq(this.t.knowledgeWiki.teamId, teamId),
         ),
       )
-      .get();
+      .limit(1);
     return row ? this.mapWikiRow(row) : null;
   }
 
   /** id-only accessor — STILL scoped by service_id (cross-Memory leak guard, 001 §2.4). */
-  getWikiById(serviceId: string, wikiId: string): WikiRow | null {
-    const row = this.db
+  async getWikiById(serviceId: string, wikiId: string): Promise<WikiRow | null> {
+    const [row] = await this.db
       .select()
-      .from(knowledgeWiki)
+      .from(this.t.knowledgeWiki)
       .where(
         and(
-          eq(knowledgeWiki.wikiId, wikiId),
-          eq(knowledgeWiki.serviceId, serviceId),
+          eq(this.t.knowledgeWiki.wikiId, wikiId),
+          eq(this.t.knowledgeWiki.serviceId, serviceId),
         ),
       )
-      .get();
+      .limit(1);
     return row ? this.mapWikiRow(row) : null;
   }
 
-  listWikis(serviceId: string, teamId: string, opts?: ListOpts): WikiRow[] {
+  async listWikis(serviceId: string, teamId: string, opts?: ListOpts): Promise<WikiRow[]> {
     const conditions: SQL[] = [
-      eq(knowledgeWiki.serviceId, serviceId),
-      eq(knowledgeWiki.teamId, teamId),
+      eq(this.t.knowledgeWiki.serviceId, serviceId),
+      eq(this.t.knowledgeWiki.teamId, teamId),
     ];
     if (opts?.syncStatus) {
-      conditions.push(eq(knowledgeWiki.status, opts.syncStatus));
+      conditions.push(eq(this.t.knowledgeWiki.status, opts.syncStatus));
     }
-    const rows = this.db
+    const rows = await this.db
       .select()
-      .from(knowledgeWiki)
+      .from(this.t.knowledgeWiki)
       .where(and(...conditions))
-      .orderBy(desc(knowledgeWiki.updatedAt))
+      .orderBy(desc(this.t.knowledgeWiki.updatedAt))
       .limit(opts?.limit ?? 20)
-      .offset(opts?.offset ?? 0)
-      .all();
+      .offset(opts?.offset ?? 0);
     return rows.map((r) => this.mapWikiRow(r));
   }
 
-  countWikis(serviceId: string, teamId: string, opts?: CountOpts): number {
+  async countWikis(serviceId: string, teamId: string, opts?: CountOpts): Promise<number> {
     const conditions: SQL[] = [
-      eq(knowledgeWiki.serviceId, serviceId),
-      eq(knowledgeWiki.teamId, teamId),
+      eq(this.t.knowledgeWiki.serviceId, serviceId),
+      eq(this.t.knowledgeWiki.teamId, teamId),
     ];
     if (opts?.syncStatus) {
-      conditions.push(eq(knowledgeWiki.status, opts.syncStatus));
+      conditions.push(eq(this.t.knowledgeWiki.status, opts.syncStatus));
     }
-    const result = this.db
-      .select({ total: sql<number>`count(*)` })
-      .from(knowledgeWiki)
+    const [result] = await this.db
+      .select({ total: sql<number>`count(*)`.mapWith(Number) })
+      .from(this.t.knowledgeWiki)
       .where(and(...conditions))
-      .get();
+      .limit(1);
     return result?.total ?? 0;
   }
 
   /** id-only mutation — scoped by service_id so a foreign tenant cannot mutate. */
-  updateWikiStatus(serviceId: string, wikiId: string, patch: WikiStatusPatch): void {
+  async updateWikiStatus(serviceId: string, wikiId: string, patch: WikiStatusPatch): Promise<void> {
     const set: Record<string, unknown> = { updatedAt: nowIso() };
     if (patch.status !== undefined) set.status = patch.status;
     if (patch.internal_status !== undefined) set.internalStatus = patch.internal_status;
@@ -407,55 +412,52 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
     if (patch.summary !== undefined) set.summary = patch.summary;
     if (patch.version !== undefined) set.version = patch.version;
 
-    this.db
-      .update(knowledgeWiki)
+    await this.db
+      .update(this.t.knowledgeWiki)
       .set(set)
       .where(
         and(
-          eq(knowledgeWiki.wikiId, wikiId),
-          eq(knowledgeWiki.serviceId, serviceId),
+          eq(this.t.knowledgeWiki.wikiId, wikiId),
+          eq(this.t.knowledgeWiki.serviceId, serviceId),
         ),
-      )
-      .run();
+      );
   }
 
-  deleteWiki(serviceId: string, teamId: string, wikiId: string): boolean {
-    const result = this.db
-      .delete(knowledgeWiki)
+  async deleteWiki(serviceId: string, teamId: string, wikiId: string): Promise<boolean> {
+    const result = await this.db
+      .delete(this.t.knowledgeWiki)
       .where(
         and(
-          eq(knowledgeWiki.wikiId, wikiId),
-          eq(knowledgeWiki.serviceId, serviceId),
-          eq(knowledgeWiki.teamId, teamId),
+          eq(this.t.knowledgeWiki.wikiId, wikiId),
+          eq(this.t.knowledgeWiki.serviceId, serviceId),
+          eq(this.t.knowledgeWiki.teamId, teamId),
         ),
-      )
-      .run();
-    return result.changes > 0;
+      );
+    return affectedRows(result) > 0;
   }
 
   /** Update wiki metadata (name, summary). memory mismatch → null. */
-  updateWikiMeta(serviceId: string, wikiId: string, patch: WikiMetaPatch): WikiRow | null {
+  async updateWikiMeta(serviceId: string, wikiId: string, patch: WikiMetaPatch): Promise<WikiRow | null> {
     const set: Record<string, unknown> = { updatedAt: nowIso() };
     if (patch.name !== undefined) set.name = patch.name;
     if (patch.summary !== undefined) set.summary = patch.summary;
-    this.db
-      .update(knowledgeWiki)
+    await this.db
+      .update(this.t.knowledgeWiki)
       .set(set)
       .where(
         and(
-          eq(knowledgeWiki.wikiId, wikiId),
-          eq(knowledgeWiki.serviceId, serviceId),
+          eq(this.t.knowledgeWiki.wikiId, wikiId),
+          eq(this.t.knowledgeWiki.serviceId, serviceId),
         ),
-      )
-      .run();
+      );
     return this.getWikiById(serviceId, wikiId);
   }
 
   // ═══════════════════════ Audit ═══════════════════════
 
-  appendWikiAudit(input: AuditLogInput): void {
-    this.db
-      .insert(knowledgeWikiAudit)
+  async appendWikiAudit(input: AuditLogInput): Promise<void> {
+    await this.db
+      .insert(this.t.knowledgeWikiAudit)
       .values({
         wikiId: input.asset_id,
         serviceId: input.service_id ?? null,
@@ -465,13 +467,12 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
         agentId: input.agent_id ?? null,
         detail: input.detail ?? null,
         createdAt: nowIso(),
-      })
-      .run();
+      });
   }
 
-  appendCodeGraphAudit(input: AuditLogInput): void {
-    this.db
-      .insert(knowledgeCodeGraphAudit)
+  async appendCodeGraphAudit(input: AuditLogInput): Promise<void> {
+    await this.db
+      .insert(this.t.knowledgeCodeGraphAudit)
       .values({
         codeGraphId: input.asset_id,
         serviceId: input.service_id ?? null,
@@ -481,24 +482,22 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
         agentId: input.agent_id ?? null,
         detail: input.detail ?? null,
         createdAt: nowIso(),
-      })
-      .run();
+      });
   }
 
-  listWikiAudit(serviceId: string, wikiId: string, limit = 20, offset = 0): AuditLogRow[] {
-    const rows = this.db
+  async listWikiAudit(serviceId: string, wikiId: string, limit = 20, offset = 0): Promise<AuditLogRow[]> {
+    const rows = await this.db
       .select()
-      .from(knowledgeWikiAudit)
+      .from(this.t.knowledgeWikiAudit)
       .where(
         and(
-          eq(knowledgeWikiAudit.wikiId, wikiId),
-          eq(knowledgeWikiAudit.serviceId, serviceId),
+          eq(this.t.knowledgeWikiAudit.wikiId, wikiId),
+          eq(this.t.knowledgeWikiAudit.serviceId, serviceId),
         ),
       )
-      .orderBy(desc(knowledgeWikiAudit.version), desc(knowledgeWikiAudit.id))
+      .orderBy(desc(this.t.knowledgeWikiAudit.version), desc(this.t.knowledgeWikiAudit.id))
       .limit(limit)
-      .offset(offset)
-      .all();
+      .offset(offset);
     return rows.map((r) => ({
       id: r.id,
       service_id: r.serviceId ?? null,
@@ -512,20 +511,19 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
     }));
   }
 
-  listCodeGraphAudit(serviceId: string, codeGraphId: string, limit = 20, offset = 0): AuditLogRow[] {
-    const rows = this.db
+  async listCodeGraphAudit(serviceId: string, codeGraphId: string, limit = 20, offset = 0): Promise<AuditLogRow[]> {
+    const rows = await this.db
       .select()
-      .from(knowledgeCodeGraphAudit)
+      .from(this.t.knowledgeCodeGraphAudit)
       .where(
         and(
-          eq(knowledgeCodeGraphAudit.codeGraphId, codeGraphId),
-          eq(knowledgeCodeGraphAudit.serviceId, serviceId),
+          eq(this.t.knowledgeCodeGraphAudit.codeGraphId, codeGraphId),
+          eq(this.t.knowledgeCodeGraphAudit.serviceId, serviceId),
         ),
       )
-      .orderBy(desc(knowledgeCodeGraphAudit.version), desc(knowledgeCodeGraphAudit.id))
+      .orderBy(desc(this.t.knowledgeCodeGraphAudit.version), desc(this.t.knowledgeCodeGraphAudit.id))
       .limit(limit)
-      .offset(offset)
-      .all();
+      .offset(offset);
     return rows.map((r) => ({
       id: r.id,
       service_id: r.serviceId ?? null,
@@ -546,56 +544,52 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
    * After restart, in-memory SerialQueue tasks are lost; this makes them visible to control plane.
    * @returns total affected rows (code + wiki combined).
    */
-  markInterruptedAsFailed(reason = "interrupted by restart"): number {
+  async markInterruptedAsFailed(reason = "interrupted by restart"): Promise<number> {
     const ts = nowIso();
-    const a = this.db
-      .update(knowledgeCodeGraph)
+    const a = await this.db
+      .update(this.t.knowledgeCodeGraph)
       .set({ status: "failed", syncError: reason, updatedAt: ts })
-      .where(sql`status IN ('pending','processing')`)
-      .run();
-    const b = this.db
-      .update(knowledgeWiki)
+      .where(sql`status IN ('pending','processing')`);
+    const b = await this.db
+      .update(this.t.knowledgeWiki)
       .set({ status: "failed", syncError: reason, updatedAt: ts })
-      .where(sql`status IN ('pending','processing')`)
-      .run();
-    return a.changes + b.changes;
+      .where(sql`status IN ('pending','processing')`);
+    return affectedRows(a) + affectedRows(b);
   }
 
   /** All ready code-graphs (with service_id) so module.ts can rebuild per-tenant dirs. */
-  listSyncedCodeGraphs(): SyncedCodeGraphRef[] {
-    return this.db
+  async listSyncedCodeGraphs(): Promise<SyncedCodeGraphRef[]> {
+    return await this.db
       .select({
-        code_graph_id: knowledgeCodeGraph.codeGraphId,
-        service_id: knowledgeCodeGraph.serviceId,
-        team_id: knowledgeCodeGraph.teamId,
+        code_graph_id: this.t.knowledgeCodeGraph.codeGraphId,
+        service_id: this.t.knowledgeCodeGraph.serviceId,
+        team_id: this.t.knowledgeCodeGraph.teamId,
       })
-      .from(knowledgeCodeGraph)
+      .from(this.t.knowledgeCodeGraph)
       .where(
         and(
-          eq(knowledgeCodeGraph.status, "ready"),
-          isNull(knowledgeCodeGraph.deletedAt),
+          eq(this.t.knowledgeCodeGraph.status, "ready"),
+          isNull(this.t.knowledgeCodeGraph.deletedAt),
         ),
-      )
-      .all();
+      );
   }
 
-  listSyncedWikis(): SyncedWikiRef[] {
-    return this.db
+  async listSyncedWikis(): Promise<SyncedWikiRef[]> {
+    return await this.db
       .select({
-        wiki_id: knowledgeWiki.wikiId,
-        service_id: knowledgeWiki.serviceId,
-        team_id: knowledgeWiki.teamId,
+        wiki_id: this.t.knowledgeWiki.wikiId,
+        service_id: this.t.knowledgeWiki.serviceId,
+        team_id: this.t.knowledgeWiki.teamId,
       })
-      .from(knowledgeWiki)
+      .from(this.t.knowledgeWiki)
       .where(
-        and(eq(knowledgeWiki.status, "ready"), isNull(knowledgeWiki.deletedAt)),
-      )
-      .all();
+        and(eq(this.t.knowledgeWiki.status, "ready"), isNull(this.t.knowledgeWiki.deletedAt)),
+      );
   }
 
   // ═══════════════════════ Mappers ═══════════════════════
 
-  private mapCgRow(r: typeof knowledgeCodeGraph.$inferSelect): CodeGraphRow {
+  private mapCgRow(r: KnowledgeCodeGraph): CodeGraphRow {
     return {
       code_graph_id: r.codeGraphId,
       service_id: r.serviceId,
@@ -624,7 +618,7 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
     };
   }
 
-  private mapWikiRow(r: typeof knowledgeWiki.$inferSelect): WikiRow {
+  private mapWikiRow(r: KnowledgeWiki): WikiRow {
     return {
       wiki_id: r.wikiId,
       service_id: r.serviceId,

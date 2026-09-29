@@ -142,11 +142,12 @@ export class CodeGraphService {
    *   runBuild 结束后若绑定已变会自动再入队。显式同 id 且 status=failed 也会重试。
    * - 新建 → 入库 pending + 后台建图。
    */
-  create(params: CreateCodeGraphParams): { row: CodeGraphRow; existed: boolean } {
-    const { row, existed } = this.store.createCodeGraph(params);
+  async create(params: CreateCodeGraphParams): Promise<{ row: CodeGraphRow; existed: boolean }> {
+    const { row, existed } = await this.store.createCodeGraph(params);
     if (!existed) {
       // repo_url 经 stripUserInfo 兜一层：历史数据里可能存在内嵌凭证写法。
-      this.audit(row, "create", sanitizeGitError(`clone ${row.repo_url}@${row.branch}`, undefined, 0), params.user_id);
+      const detail = sanitizeGitError(`clone ${row.repo_url}@${row.branch}`, undefined, 0);
+      await this.audit(row, "create", detail, params.user_id);
       this.enqueueBuild(row);
       return { row, existed };
     }
@@ -164,12 +165,12 @@ export class CodeGraphService {
       return this.requeueBuild(params.service_id, row.code_graph_id, row, params.user_id, "retry failed build");
     }
 
-    const updated = this.store.updateCodeGraphMeta(params.service_id, row.code_graph_id, {
+    const updated = await this.store.updateCodeGraphMeta(params.service_id, row.code_graph_id, {
       credential_id: incoming,
     });
     if (!updated) return { row, existed };
 
-    this.audit(
+    await this.audit(
       updated,
       "create",
       sanitizeGitError(
@@ -191,22 +192,22 @@ export class CodeGraphService {
   }
 
   /** 置 pending 并入队建图（幂等 create 换绑 / failed 重试用）。 */
-  private requeueBuild(
+  private async requeueBuild(
     serviceId: string,
     codeGraphId: string,
     fallback: CodeGraphRow,
     userId?: string,
     auditDetail?: string,
-  ): { row: CodeGraphRow; existed: boolean } {
-    this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
+  ): Promise<{ row: CodeGraphRow; existed: boolean }> {
+    await this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
       status: "pending",
       internal_status: null,
       sync_error: null,
     });
-    const fresh = this.store.getCodeGraphById(serviceId, codeGraphId);
+    const fresh = await this.store.getCodeGraphById(serviceId, codeGraphId);
     if (fresh) {
       if (auditDetail) {
-        this.audit(fresh, "create", sanitizeGitError(auditDetail, undefined, 0), userId);
+        await this.audit(fresh, "create", sanitizeGitError(auditDetail, undefined, 0), userId);
       }
       this.enqueueBuild(fresh);
       return { row: fresh, existed: true };
@@ -215,8 +216,8 @@ export class CodeGraphService {
   }
 
   /** Persist service_url for a code-graph. Returns updated row or null. */
-  updateServiceUrl(serviceId: string, codeGraphId: string, serviceUrl: string): CodeGraphRow | null {
-    this.store.updateCodeGraphStatus(serviceId, codeGraphId, { service_url: serviceUrl });
+  async updateServiceUrl(serviceId: string, codeGraphId: string, serviceUrl: string): Promise<CodeGraphRow | null> {
+    await this.store.updateCodeGraphStatus(serviceId, codeGraphId, { service_url: serviceUrl });
     return this.store.getCodeGraphById(serviceId, codeGraphId);
   }
 
@@ -225,45 +226,45 @@ export class CodeGraphService {
     serviceId: string,
     codeGraphId: string,
     patch: { repo_name?: string; summary?: string | null; credential_id?: string | null },
-  ): CodeGraphRow | null {
+  ): Promise<CodeGraphRow | null> {
     return this.store.updateCodeGraphMeta(serviceId, codeGraphId, patch);
   }
 
   /** 重新拉取 + 重建（管控显式触发）。memory/team 不匹配返回 not_found；pending/processing 返回 busy。 */
-  sync(serviceId: string, teamId: string, codeGraphId: string, requesterUserId?: string): SyncResult {
-    const row = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
+  async sync(serviceId: string, teamId: string, codeGraphId: string, requesterUserId?: string): Promise<SyncResult> {
+    const row = await this.store.getCodeGraph(serviceId, teamId, codeGraphId);
     if (!row) return { kind: "not_found" };
     // 并发拒绝：正在排队/执行中直接拒绝，不覆盖状态、不重复入队、不写 audit。
     if (row.status === "pending" || row.status === "processing") {
       return { kind: "busy", status: row.status, step: row.internal_status };
     }
     const nextVersion = row.version + 1;
-    this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
+    await this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
       status: "pending",
       internal_status: null,
       sync_error: null,
       version: nextVersion,
     });
-    this.audit({ ...row, version: nextVersion }, "ingest", "manual sync", requesterUserId);
-    const fresh = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
+    await this.audit({ ...row, version: nextVersion }, "ingest", "manual sync", requesterUserId);
+    const fresh = await this.store.getCodeGraph(serviceId, teamId, codeGraphId);
     if (fresh) this.enqueueBuild(fresh);
     return fresh ? { kind: "ok", row: fresh } : { kind: "not_found" };
   }
 
-  get(serviceId: string, teamId: string, codeGraphId: string): CodeGraphRow | null {
+  get(serviceId: string, teamId: string, codeGraphId: string): Promise<CodeGraphRow | null> {
     return this.store.getCodeGraph(serviceId, teamId, codeGraphId);
   }
 
   /** 按全局唯一 code_graph_id 查询（仍按 service_id 收敛防跨租户）。spec id-only 端点专用。 */
-  getById(serviceId: string, codeGraphId: string): CodeGraphRow | null {
+  getById(serviceId: string, codeGraphId: string): Promise<CodeGraphRow | null> {
     return this.store.getCodeGraphById(serviceId, codeGraphId);
   }
 
-  list(serviceId: string, teamId: string, opts?: ListOpts): CodeGraphRow[] {
+  list(serviceId: string, teamId: string, opts?: ListOpts): Promise<CodeGraphRow[]> {
     return this.store.listCodeGraphs(serviceId, teamId, opts);
   }
 
-  count(serviceId: string, teamId: string, opts?: CountOpts): number {
+  count(serviceId: string, teamId: string, opts?: CountOpts): Promise<number> {
     return this.store.countCodeGraphs(serviceId, teamId, opts);
   }
 
@@ -275,8 +276,8 @@ export class CodeGraphService {
    * 在检查点中止；随后立即硬删 + 清理（不等 worker）。worker 结束前重查发现
    * 已删则跳过 ready/回调并再做一次幂等清理，无残留。
    */
-  delete(serviceId: string, teamId: string, codeGraphId: string): boolean {
-    const row = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
+  async delete(serviceId: string, teamId: string, codeGraphId: string): Promise<boolean> {
+    const row = await this.store.getCodeGraph(serviceId, teamId, codeGraphId);
     if (!row) return false;
 
     // 通知 in-flight worker 中止（pending 排队 or processing 执行中）。
@@ -284,8 +285,8 @@ export class CodeGraphService {
       this.cancelled.add(codeGraphId);
     }
 
-    this.audit(row, "delete", null);
-    this.cleanupResources(serviceId, teamId, codeGraphId);
+    await this.audit(row, "delete", null);
+    await this.cleanupResources(serviceId, teamId, codeGraphId);
 
     // worker 若仍在跑，会在检查点看到行已被硬删（getById → null）而中止；
     // cancelled 标记留到 worker 结束由其自行清理（见 runBuild），此处不删标记，
@@ -301,14 +302,14 @@ export class CodeGraphService {
    *   3. 磁盘目录：rmSync recursive+force（幂等）
    * BuildQueue 排队任务由 runBuild 入口检查 cancelled/行存在性跳过，无需在此处理。
    */
-  private cleanupResources(serviceId: string, teamId: string, codeGraphId: string): void {
+  private async cleanupResources(serviceId: string, teamId: string, codeGraphId: string): Promise<void> {
     try {
       this.releaseInstance?.(codeGraphId);
     } catch (err) {
       this.logger?.warn?.(`[code-graph] release instance failed ${codeGraphId}: ${String(err)}`);
     }
     try {
-      this.store.deleteCodeGraph(serviceId, teamId, codeGraphId);
+      await this.store.deleteCodeGraph(serviceId, teamId, codeGraphId);
     } catch (err) {
       this.logger?.warn?.(`[code-graph] hard-delete row failed ${codeGraphId}: ${String(err)}`);
     }
@@ -324,14 +325,19 @@ export class CodeGraphService {
    * 双判据覆盖：①delete 发生在 worker 运行中（cancelled）；②delete 已完成
    * 且行被硬删（getById → null）。任一即视为已删。
    */
-  private isDeleted(serviceId: string, codeGraphId: string): boolean {
-    return this.cancelled.has(codeGraphId) || this.store.getCodeGraphById(serviceId, codeGraphId) === null;
+  private async isDeleted(serviceId: string, codeGraphId: string): Promise<boolean> {
+    return this.cancelled.has(codeGraphId) || (await this.store.getCodeGraphById(serviceId, codeGraphId)) === null;
   }
 
   /** 写一条 code-graph 审计记录。失败不阻断主流程。 */
-  private audit(row: CodeGraphRow, action: AuditAction, detail: string | null, requesterUserId?: string): void {
+  private async audit(
+    row: CodeGraphRow,
+    action: AuditAction,
+    detail: string | null,
+    requesterUserId?: string,
+  ): Promise<void> {
     try {
-      this.store.appendCodeGraphAudit({
+      await this.store.appendCodeGraphAudit({
         service_id: row.service_id,
         asset_id: row.code_graph_id,
         version: row.version,
@@ -361,18 +367,19 @@ export class CodeGraphService {
     branch: string,
   ): Promise<void> {
     // 入口检查点：pending 期间被删 → 直接跳过，不置 processing、不建图。
-    if (this.isDeleted(serviceId, codeGraphId)) {
-      this.finishCancelled(serviceId, teamId, codeGraphId);
+    if (await this.isDeleted(serviceId, codeGraphId)) {
+      await this.finishCancelled(serviceId, teamId, codeGraphId);
       return;
     }
     // 以库内最新绑定为准（幂等 create / update-meta 可能在排队窗口换绑）。
-    const latest = this.store.getCodeGraphById(serviceId, codeGraphId);
+    const latest = await this.store.getCodeGraphById(serviceId, codeGraphId);
     const credentialId = latest?.credential_id ?? null;
-    this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
+    await this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
       status: "processing",
       internal_status: "cloning",
       sync_error: null,
     });
+    let statusWrites: Promise<void> = Promise.resolve();
     try {
       const result = await this.worker({
         codeGraphId,
@@ -382,19 +389,25 @@ export class CodeGraphService {
         branch,
         dir: this.dirFor(serviceId, teamId, codeGraphId),
         credentialId,
-        setInternalStatus: (s) =>
-          this.store.updateCodeGraphStatus(serviceId, codeGraphId, { status: "processing", internal_status: s }),
+        setInternalStatus: (s) => {
+          // Workers call this synchronously; chain the writes so they land in order and before the final status.
+          const patch = { status: "processing" as const, internal_status: s };
+          statusWrites = statusWrites
+            .then(() => this.store.updateCodeGraphStatus(serviceId, codeGraphId, patch))
+            .catch((err) => this.logger?.warn?.(`[code-graph] status ${s} failed ${codeGraphId}: ${String(err)}`));
+        },
       });
+      await statusWrites;
       // 结束前检查点：processing 期间被删 → 跳过 ready/audit/回调，做幂等收尾清理。
-      if (this.isDeleted(serviceId, codeGraphId)) {
-        this.finishCancelled(serviceId, teamId, codeGraphId);
+      if (await this.isDeleted(serviceId, codeGraphId)) {
+        await this.finishCancelled(serviceId, teamId, codeGraphId);
         return;
       }
       // 凭证在 processing 窗口已换绑：跳过 ready/审计/TMC 回调，直接再入队，
       // 避免下游收到与最终状态不一致的回调或短暂暴露旧凭证产物。
-      if (this.requeueIfCredentialChanged(serviceId, codeGraphId, credentialId)) return;
+      if (await this.requeueIfCredentialChanged(serviceId, codeGraphId, credentialId)) return;
 
-      this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
+      await this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
         status: "ready",
         internal_status: null,
         sync_error: null,
@@ -402,34 +415,35 @@ export class CodeGraphService {
         stats_json: result.stats ? JSON.stringify(result.stats) : null,
         last_sync_at: new Date().toISOString(),
       });
-      const synced = this.store.getCodeGraphById(serviceId, codeGraphId);
+      const synced = await this.store.getCodeGraphById(serviceId, codeGraphId);
       if (synced) {
-        this.audit(synced, "ready", result.stats ? JSON.stringify(result.stats) : null);
+        await this.audit(synced, "ready", result.stats ? JSON.stringify(result.stats) : null);
       }
       this.logger?.info?.(`[code-graph] ${codeGraphId} ready`);
 
       // Auto-generate summary + callback TMC
       await this.onBuildComplete(synced, "ready", null, result.stats ?? null);
     } catch (err) {
+      await statusWrites;
       const raw = err instanceof Error ? err.message : String(err);
       // 统一脱敏：错误信息会被写进 sync_error（落库）、审计 detail、服务日志，
       // 并经 TMC 回调外发。git 的 stderr 会原样回显 URL，历史 URL 可能内嵌凭证。
       const msg = sanitizeGitError(raw);
       // worker 抛错，但若期间已被删，视为取消而非失败：跳过 failed 状态/回调，做清理。
-      if (this.isDeleted(serviceId, codeGraphId)) {
-        this.finishCancelled(serviceId, teamId, codeGraphId);
+      if (await this.isDeleted(serviceId, codeGraphId)) {
+        await this.finishCancelled(serviceId, teamId, codeGraphId);
         return;
       }
       // 换绑后的失败同样不应落 failed / 回调；用新凭证再跑一轮。
-      if (this.requeueIfCredentialChanged(serviceId, codeGraphId, credentialId)) return;
+      if (await this.requeueIfCredentialChanged(serviceId, codeGraphId, credentialId)) return;
 
-      this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
+      await this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
         status: "failed",
         internal_status: null,
         sync_error: msg,
       });
-      const failed = this.store.getCodeGraphById(serviceId, codeGraphId);
-      if (failed) this.audit(failed, "failed", msg);
+      const failed = await this.store.getCodeGraphById(serviceId, codeGraphId);
+      if (failed) await this.audit(failed, "failed", msg);
       this.logger?.warn?.(`[code-graph] ${codeGraphId} failed: ${msg}`);
 
       // Callback TMC about failure
@@ -442,13 +456,13 @@ export class CodeGraphService {
    * 若库内绑定已变且行仍在，重置 pending 并再入队；返回 true 表示已接管收尾
    * （调用方不得再写 ready/failed 或发 TMC 回调）。
    */
-  private requeueIfCredentialChanged(
+  private async requeueIfCredentialChanged(
     serviceId: string,
     codeGraphId: string,
     usedCredentialId: string | null,
-  ): boolean {
-    if (this.isDeleted(serviceId, codeGraphId)) return false;
-    const current = this.store.getCodeGraphById(serviceId, codeGraphId);
+  ): Promise<boolean> {
+    if (await this.isDeleted(serviceId, codeGraphId)) return false;
+    const current = await this.store.getCodeGraphById(serviceId, codeGraphId);
     if (!current) return false;
     if ((current.credential_id ?? null) === (usedCredentialId ?? null)) return false;
 
@@ -456,12 +470,12 @@ export class CodeGraphService {
       `[code-graph] ${codeGraphId} credential changed during build ` +
         `(used=${usedCredentialId ?? "null"} → now=${current.credential_id ?? "null"}); re-queue`,
     );
-    this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
+    await this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
       status: "pending",
       internal_status: null,
       sync_error: null,
     });
-    const fresh = this.store.getCodeGraphById(serviceId, codeGraphId);
+    const fresh = await this.store.getCodeGraphById(serviceId, codeGraphId);
     if (fresh) this.enqueueBuild(fresh);
     return true;
   }
@@ -470,8 +484,8 @@ export class CodeGraphService {
    * worker 检查点判定“已删”后的收尾：幂等清理 worker 可能刚写下的盘/句柄，
    * 并移除 cancelled 标记（该 id 的 worker 到此结束，标记使命完成）。
    */
-  private finishCancelled(serviceId: string, teamId: string, codeGraphId: string): void {
-    this.cleanupResources(serviceId, teamId, codeGraphId);
+  private async finishCancelled(serviceId: string, teamId: string, codeGraphId: string): Promise<void> {
+    await this.cleanupResources(serviceId, teamId, codeGraphId);
     this.cancelled.delete(codeGraphId);
     this.logger?.info?.(`[code-graph] ${codeGraphId} build aborted (deleted during processing)`);
   }
@@ -495,7 +509,7 @@ export class CodeGraphService {
       const { generateCodeGraphSummary } = await import("../callback.js");
       summary = generateCodeGraphSummary(row.repo_name || row.repo_url, row.branch, stats);
       if (summary) {
-        this.store.updateCodeGraphStatus(row.service_id, row.code_graph_id, { summary });
+        await this.store.updateCodeGraphStatus(row.service_id, row.code_graph_id, { summary });
       }
     }
 

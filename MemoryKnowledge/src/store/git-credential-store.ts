@@ -21,8 +21,8 @@
 
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 
-import type { Db } from "../db/client.js";
-import { knowledgeGitCredential, knowledgeGitCredentialAudit } from "../db/schema.js";
+import { asKnowledgeDb, type Db, type KnowledgeDb } from "../db/client.js";
+import type { KnowledgeGitCredential } from "../db/schema.js";
 import { decryptSecret, deriveSecretKey, encryptSecret, fingerprintSecret } from "../crypto/secret-box.js";
 import { normalizeHost, parseGitUrl } from "../source-fetcher/git-url.js";
 import type { GitAuthMaterial } from "../source-fetcher/git-auth.js";
@@ -43,37 +43,49 @@ export class DuplicateCredentialNameError extends Error {
 }
 
 export interface GitCredentialStoreOptions {
-  db: Db;
+  /** Upstream's SQLite `Db`, or a dialect-selecting `KnowledgeDb`. */
+  db: Db | KnowledgeDb;
   /** KNOWLEDGE_SECRET_KEY；为空则读写凭证都会抛 SecretKeyError。 */
   secretKey: string;
 }
 
 export interface IGitCredentialStore {
-  create(input: CreateGitCredentialInput): GitCredentialRow;
-  list(serviceId: string, teamId: string): GitCredentialRow[];
-  get(serviceId: string, teamId: string, credentialId: string): GitCredentialRow | null;
-  delete(serviceId: string, teamId: string, credentialIds: string[]): { deleted_ids: string[]; failed: Array<{ id: string; reason: string }> };
+  create(input: CreateGitCredentialInput): Promise<GitCredentialRow>;
+  list(serviceId: string, teamId: string): Promise<GitCredentialRow[]>;
+  get(serviceId: string, teamId: string, credentialId: string): Promise<GitCredentialRow | null>;
+  delete(
+    serviceId: string,
+    teamId: string,
+    credentialIds: string[],
+  ): Promise<{ deleted_ids: string[]; failed: Array<{ id: string; reason: string }> }>;
   /**
    * 取出可直接交给 git 的明文材料。
    * @returns null = 该 team 下没有匹配该 host 的凭证（按匿名访问继续）
    * @throws SecretKeyError / 解密失败 —— 有凭证但读不出来必须显式失败，不能静默降级为匿名。
    */
-  resolveMaterial(serviceId: string, teamId: string, repoUrl: string, credentialId?: string | null): GitAuthMaterial | null;
+  resolveMaterial(
+    serviceId: string,
+    teamId: string,
+    repoUrl: string,
+    credentialId?: string | null,
+  ): Promise<GitAuthMaterial | null>;
   /** 该 host 是否已存在可用凭证（供路由做 host 绑定校验）。 */
-  findByHost(serviceId: string, teamId: string, host: string): GitCredentialRow | null;
-  countForService(serviceId: string): number;
+  findByHost(serviceId: string, teamId: string, host: string): Promise<GitCredentialRow | null>;
+  countForService(serviceId: string): Promise<number>;
   appendAudit(input: {
     service_id?: string | null;
     credential_id: string;
     action: CredentialAuditAction;
     user_id?: string | null;
     detail?: string | null;
-  }): void;
-  listAudit(serviceId: string, credentialId: string, limit?: number): CredentialAuditRow[];
+  }): Promise<void>;
+  listAudit(serviceId: string, credentialId: string, limit?: number): Promise<CredentialAuditRow[]>;
 }
 
 export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitCredentialStore {
-  const { db } = opts;
+  const kdb = asKnowledgeDb(opts.db);
+  const db = kdb.orm;
+  const { knowledgeGitCredential, knowledgeGitCredentialAudit } = kdb.tables;
 
   /** 惰性派生主密钥：未配置时只在真正需要加解密的那一刻才报错，不影响服务启动时的公开仓库路径。 */
   let cachedKey: Buffer | null = null;
@@ -83,10 +95,10 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
   }
 
   const store: IGitCredentialStore = {
-    create(input: CreateGitCredentialInput): GitCredentialRow {
+    async create(input: CreateGitCredentialInput): Promise<GitCredentialRow> {
       const now = new Date().toISOString();
       const secret = key(); // 先确保主密钥可用，避免插入到一半才失败
-      const existing = db
+      const existing = await db
         .select({ id: knowledgeGitCredential.credentialId })
         .from(knowledgeGitCredential)
         .where(
@@ -97,10 +109,10 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
             isNull(knowledgeGitCredential.deletedAt),
           ),
         )
-        .all();
+        .limit(1);
       if (existing.length > 0) throw new DuplicateCredentialNameError(input.name);
 
-      db.insert(knowledgeGitCredential)
+      await db.insert(knowledgeGitCredential)
         .values({
           credentialId: input.credential_id,
           serviceId: input.service_id,
@@ -117,14 +129,13 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
           createdAt: now,
           updatedAt: now,
           deletedAt: null,
-        })
-        .run();
+        });
 
-      return store.get(input.service_id, input.team_id, input.credential_id)!;
+      return (await store.get(input.service_id, input.team_id, input.credential_id))!;
     },
 
-    list(serviceId: string, teamId: string): GitCredentialRow[] {
-      return db
+    async list(serviceId: string, teamId: string): Promise<GitCredentialRow[]> {
+      const rows = await db
         .select()
         .from(knowledgeGitCredential)
         .where(
@@ -134,13 +145,12 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
             isNull(knowledgeGitCredential.deletedAt),
           ),
         )
-        .orderBy(desc(knowledgeGitCredential.updatedAt))
-        .all()
-        .map(toRow);
+        .orderBy(desc(knowledgeGitCredential.updatedAt));
+      return rows.map(toRow);
     },
 
-    get(serviceId: string, teamId: string, credentialId: string): GitCredentialRow | null {
-      const row = db
+    async get(serviceId: string, teamId: string, credentialId: string): Promise<GitCredentialRow | null> {
+      const [row] = await db
         .select()
         .from(knowledgeGitCredential)
         .where(
@@ -151,13 +161,13 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
             isNull(knowledgeGitCredential.deletedAt),
           ),
         )
-        .all()[0];
+        .limit(1);
       return row ? toRow(row) : null;
     },
 
-    findByHost(serviceId: string, teamId: string, host: string): GitCredentialRow | null {
+    async findByHost(serviceId: string, teamId: string, host: string): Promise<GitCredentialRow | null> {
       const normalized = normalizeHost(host);
-      const row = db
+      const [row] = await db
         .select()
         .from(knowledgeGitCredential)
         .where(
@@ -168,11 +178,11 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
             isNull(knowledgeGitCredential.deletedAt),
           ),
         )
-        .all()[0];
+        .limit(1);
       return row ? toRow(row) : null;
     },
 
-    delete(serviceId: string, teamId: string, credentialIds: string[]) {
+    async delete(serviceId: string, teamId: string, credentialIds: string[]) {
       const result: { deleted_ids: string[]; failed: Array<{ id: string; reason: string }> } = {
         deleted_ids: [],
         failed: [],
@@ -180,14 +190,14 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
       const now = new Date().toISOString();
 
       for (const id of credentialIds) {
-        const row = store.get(serviceId, teamId, id);
+        const row = await store.get(serviceId, teamId, id);
         if (!row) {
           result.failed.push({ id, reason: "not found" });
           continue;
         }
         // 软删：留痕，且让 pending/processing 中的 build 在 resolveMaterial
         // 时明确失败（而不是拿到一个已消失的行）。
-        db.update(knowledgeGitCredential)
+        await db.update(knowledgeGitCredential)
           .set({ deletedAt: now, updatedAt: now })
           .where(
             and(
@@ -195,47 +205,45 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
               eq(knowledgeGitCredential.teamId, teamId),
               eq(knowledgeGitCredential.credentialId, id),
             ),
-          )
-          .run();
+          );
         result.deleted_ids.push(id);
       }
 
       return result;
     },
 
-    resolveMaterial(
+    async resolveMaterial(
       serviceId: string,
       teamId: string,
       repoUrl: string,
       credentialId?: string | null,
-    ): GitAuthMaterial | null {
+    ): Promise<GitAuthMaterial | null> {
       const parsed = parseGitUrl(repoUrl);
       if (!parsed) return null;
 
       const row = credentialId
-        ? store.get(serviceId, teamId, credentialId)
-        : store.findByHost(serviceId, teamId, parsed.host);
+        ? await store.get(serviceId, teamId, credentialId)
+        : await store.findByHost(serviceId, teamId, parsed.host);
 
       if (!row) return null;
 
       // host 强绑定：即使调用方显式指定了 credential_id，也必须与 repo_url 一致。
       if (row.host !== parsed.host) return null;
 
-      return materialFrom(row, decrypt(row, key()));
+      return materialFrom(row, await decrypt(row, key()));
     },
 
-    countForService(serviceId: string): number {
-      const rows = db
-        .select({ n: sql<number>`count(*)` })
+    async countForService(serviceId: string): Promise<number> {
+      const rows = await db
+        .select({ n: sql<number>`count(*)`.mapWith(Number) })
         .from(knowledgeGitCredential)
-        .where(and(eq(knowledgeGitCredential.serviceId, serviceId), isNull(knowledgeGitCredential.deletedAt)))
-        .all();
+        .where(and(eq(knowledgeGitCredential.serviceId, serviceId), isNull(knowledgeGitCredential.deletedAt)));
       return Number(rows[0]?.n ?? 0);
     },
 
-    appendAudit(input) {
+    async appendAudit(input) {
       try {
-        db.insert(knowledgeGitCredentialAudit)
+        await db.insert(knowledgeGitCredentialAudit)
           .values({
             credentialId: input.credential_id,
             serviceId: input.service_id ?? null,
@@ -243,15 +251,14 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
             userId: input.user_id ?? null,
             detail: input.detail ?? null,
             createdAt: new Date().toISOString(),
-          })
-          .run();
+          });
       } catch {
         // 审计失败不阻断主流程（与 code-graph 审计一致）
       }
     },
 
-    listAudit(serviceId: string, credentialId: string, limit = 50): CredentialAuditRow[] {
-      return db
+    async listAudit(serviceId: string, credentialId: string, limit = 50): Promise<CredentialAuditRow[]> {
+      const rows = await db
         .select()
         .from(knowledgeGitCredentialAudit)
         .where(
@@ -261,9 +268,8 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
           ),
         )
         .orderBy(desc(knowledgeGitCredentialAudit.id))
-        .limit(limit)
-        .all()
-        .map((r) => ({
+        .limit(limit);
+      return rows.map((r) => ({
           id: r.id,
           credential_id: r.credentialId,
           service_id: r.serviceId ?? null,
@@ -279,12 +285,13 @@ export function createGitCredentialStore(opts: GitCredentialStoreOptions): IGitC
 
   // ── helpers ──
 
-  function decrypt(row: GitCredentialRow, secret: Buffer): string {
-    const enc = db
+  async function decrypt(row: GitCredentialRow, secret: Buffer): Promise<string> {
+    const [found] = await db
       .select({ secretEnc: knowledgeGitCredential.secretEnc })
       .from(knowledgeGitCredential)
       .where(eq(knowledgeGitCredential.credentialId, row.credential_id))
-      .all()[0]?.secretEnc;
+      .limit(1);
+    const enc = found?.secretEnc;
 
     if (!enc) throw new Error(`git credential ${row.credential_id} has no stored secret`);
     return decryptSecret(enc, secret, row.credential_id);
@@ -297,7 +304,7 @@ function materialFrom(row: GitCredentialRow, plaintext: string): GitAuthMaterial
     : { kind: "https_token", username: row.username ?? undefined, token: plaintext };
 }
 
-function toRow(r: typeof knowledgeGitCredential.$inferSelect): GitCredentialRow {
+function toRow(r: KnowledgeGitCredential): GitCredentialRow {
   return {
     credential_id: r.credentialId,
     service_id: r.serviceId,

@@ -1,7 +1,9 @@
 /**
  * Drizzle client initialization — creates better-sqlite3 Database + drizzle wrapper.
  *
- * Synchronous driver, matches existing store call patterns.
+ * `createDb` is upstream's synchronous SQLite entry point. `openKnowledgeDb` picks the dialect:
+ * Postgres (drizzle node-postgres) when a `postgres://` URL is given, otherwise this SQLite file.
+ * Stores take a `KnowledgeDb` and `await` drizzle builders, which are thenables on both drivers.
  */
 
 import Database from "better-sqlite3";
@@ -12,6 +14,107 @@ import { dirname } from "node:path";
 import * as schema from "./schema.js";
 
 export type Db = BetterSQLite3Database<typeof schema>;
+
+export type Dialect = "sqlite" | "postgres";
+
+/** The tables the stores query. Typed with the SQLite schema; Postgres passes its twins (schema.pg.ts). */
+export interface KnowledgeTables {
+  knowledgeCodeGraph: typeof schema.knowledgeCodeGraph;
+  knowledgeWiki: typeof schema.knowledgeWiki;
+  knowledgeWikiAudit: typeof schema.knowledgeWikiAudit;
+  knowledgeCodeGraphAudit: typeof schema.knowledgeCodeGraphAudit;
+  knowledgeGitCredential: typeof schema.knowledgeGitCredential;
+  knowledgeGitCredentialAudit: typeof schema.knowledgeGitCredentialAudit;
+  llmBinding: typeof schema.llmBinding;
+}
+
+/**
+ * Dialect-neutral handle. `orm` is typed as the SQLite drizzle db so builder chains type-check once;
+ * on Postgres it is a node-postgres drizzle db with the pg tables — only the builder methods both
+ * dialects share (select/insert/update/delete/onConflictDoUpdate) may be used, always via `await`.
+ */
+export interface KnowledgeDb {
+  readonly dialect: Dialect;
+  readonly orm: Db;
+  readonly tables: KnowledgeTables;
+  close(): Promise<void>;
+}
+
+const SQLITE_TABLES: KnowledgeTables = {
+  knowledgeCodeGraph: schema.knowledgeCodeGraph,
+  knowledgeWiki: schema.knowledgeWiki,
+  knowledgeWikiAudit: schema.knowledgeWikiAudit,
+  knowledgeCodeGraphAudit: schema.knowledgeCodeGraphAudit,
+  knowledgeGitCredential: schema.knowledgeGitCredential,
+  knowledgeGitCredentialAudit: schema.knowledgeGitCredentialAudit,
+  llmBinding: schema.llmBinding,
+};
+
+export function sqliteKnowledgeDb(db: Db, raw?: Database.Database): KnowledgeDb {
+  return {
+    dialect: "sqlite",
+    orm: db,
+    tables: SQLITE_TABLES,
+    close: async () => {
+      raw?.close();
+    },
+  };
+}
+
+/** Accept upstream-style `Db` (SQLite) wherever a `KnowledgeDb` is expected. */
+export function asKnowledgeDb(db: Db | KnowledgeDb): KnowledgeDb {
+  return "dialect" in db && "tables" in db ? (db as KnowledgeDb) : sqliteKnowledgeDb(db as Db);
+}
+
+export interface OpenKnowledgeDbOptions {
+  /** `postgres://…` / `postgresql://…` selects Postgres; empty keeps SQLite at `path`. */
+  url?: string;
+  /** SQLite file (ignored when `url` is set). */
+  path: string;
+  /** Postgres schema for the tables (created if missing); default: the connection's search_path. */
+  schema?: string;
+  /** Postgres pool size. */
+  poolMax?: number;
+  autoMigrate?: boolean;
+}
+
+export function isPostgresUrl(url: string | undefined): url is string {
+  return !!url && /^postgres(ql)?:\/\//i.test(url.trim());
+}
+
+export async function openKnowledgeDb(opts: OpenKnowledgeDbOptions): Promise<KnowledgeDb> {
+  if (opts.url && !isPostgresUrl(opts.url)) {
+    throw new Error("KNOWLEDGE_DB_URL must start with postgres:// or postgresql://");
+  }
+  if (isPostgresUrl(opts.url)) {
+    // Loaded lazily so SQLite deployments never import pg.
+    const { openPostgresDb } = await import("./client-pg.js");
+    return openPostgresDb({
+      url: opts.url,
+      schema: opts.schema,
+      poolMax: opts.poolMax,
+      autoMigrate: opts.autoMigrate,
+    });
+  }
+  const { db, raw } = createDb({ path: opts.path, autoMigrate: opts.autoMigrate });
+  return sqliteKnowledgeDb(db, raw);
+}
+
+/** Rows touched by an awaited insert/update/delete: better-sqlite3 `changes`, node-postgres `rowCount`. */
+export function affectedRows(res: unknown): number {
+  const r = res as { changes?: number; rowCount?: number | null } | undefined;
+  return Number(r?.changes ?? r?.rowCount ?? 0);
+}
+
+/** Unique/PK violation on either dialect; drizzle may wrap the driver error in `cause`. */
+export function isUniqueViolation(err: unknown): boolean {
+  for (let e: unknown = err, depth = 0; e && depth < 5; e = (e as { cause?: unknown }).cause, depth++) {
+    if ((e as { code?: unknown }).code === "23505") return true;
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/UNIQUE constraint failed|SQLITE_CONSTRAINT/i.test(msg)) return true;
+  }
+  return false;
+}
 
 export interface CreateDbOptions {
   /** Path to SQLite file. Use ":memory:" for in-memory DB. */
