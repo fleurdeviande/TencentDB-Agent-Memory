@@ -36,8 +36,8 @@ export interface LocalBackendResolverDeps {
   fileStore?: FsKind | undefined;
   /**
    * FILE_STORE_OTHERS explicit override (only meaningful with
-   * fileStore="rowfs"); undefined → per-mode default (standalone → local,
-   * service → cos). The TCS mongofs default is derived by the future
+   * fileStore="rowfs"); undefined → per-mode default (storeMode postgres →
+   * pgfs, else standalone → local, service → cos). The TCS mongofs default is derived by the future
    * TcsResolver, not here.
    */
   fileStoreOthers?: FsOthersKind | undefined;
@@ -78,8 +78,10 @@ export class LocalBackendResolver implements BackendResolver {
     // (两轴模型定稿 §5 映射): local/cos are single-backend forms
     // (profile=files, the others leg serves every key); rowfs is the
     // composite form (profile=rows + an others leg).
+    // STORE_MODE=postgres defaults to the diskless form: rows + pgfs.
+    const postgres = this.deps.storeMode === "postgres";
     const mode: FsKind =
-      this.deps.fileStore ?? (this.deps.deployMode === "service" ? "cos" : "local");
+      this.deps.fileStore ?? (postgres ? "rowfs" : this.deps.deployMode === "service" ? "cos" : "local");
     switch (mode) {
       case "local":
         return { profile: "files", others: { kind: "local", conn: null } };
@@ -88,12 +90,14 @@ export class LocalBackendResolver implements BackendResolver {
       case "rowfs": {
         const othersKind: FsOthersKind =
           this.deps.fileStoreOthers ??
-          (this.deps.deployMode === "service" ? "cos" : "local");
+          (postgres ? "pgfs" : this.deps.deployMode === "service" ? "cos" : "local");
         switch (othersKind) {
           case "local":
             return { profile: "rows", others: { kind: "local", conn: null } };
           case "mongofs":
             return { profile: "rows", others: { kind: "mongofs", conn: null } };
+          case "pgfs":
+            return { profile: "rows", others: { kind: "pgfs", conn: null } };
           case "cos":
             return { profile: "rows", others: await this.resolveCosOthers() };
         }

@@ -46,7 +46,8 @@ export type DeployMode = "standalone" | "service";
  *             combination is validated at assembly, not here)
  *
  * env: `FILE_STORE_MODE`; yaml: `data.fileStore`. Default by deploy mode
- * (§5.3.1): service → cos, standalone → local.
+ * (§5.3.1): service → cos, standalone → local; `STORE_MODE=postgres` → rowfs
+ * (with the pgfs others leg nothing of the file plane touches the disk).
  */
 export type FileStoreMode = "local" | "cos" | "rowfs";
 
@@ -55,9 +56,11 @@ export type FileStoreMode = "local" | "cos" | "rowfs";
  * `fileStore === "rowfs"` (env `FILE_STORE_OTHERS` / yaml
  * `data.fileStoreOthers`). `mongofs` keeps every byte in the instance's
  * Mongo database (the TCS zero-disk form) and is only legal with
- * STORE_MODE=mongodb — validated by the selection layer, not here.
+ * STORE_MODE=mongodb — validated by the selection layer, not here. `pgfs` is
+ * the Postgres equivalent (instance schema), legal with STORE_MODE=postgres
+ * and its default there.
  */
-export type FileStoreOthersMode = "local" | "cos" | "mongofs";
+export type FileStoreOthersMode = "local" | "cos" | "mongofs" | "pgfs";
 
 /**
  * Resolve the P9 kill switch (`TDAI_BACKEND_RESOLVER` / `features.backendResolver`).
@@ -471,14 +474,19 @@ export function parseBrokers(brokers: string | string[]): string[] {
  *
  * Semantics (design doc §5.3.1, 2026-08-31 定稿):
  * - unset → default by deploy mode: service → `cos`, standalone → `local`;
+ *   `STORE_MODE=postgres` (the third argument) → `rowfs`;
  * - set to a valid value → that value wins over the default;
  * - set to anything else → config parse failure, fail-fast (throw).
  */
 export function resolveFileStoreMode(
   raw: string | undefined,
   deployMode: DeployMode,
+  storeMode?: string,
 ): FileStoreMode {
-  if (raw === undefined) return deployMode === "service" ? "cos" : "local";
+  if (raw === undefined) {
+    if (storeMode === "postgres") return "rowfs";
+    return deployMode === "service" ? "cos" : "local";
+  }
   if (raw === "local" || raw === "cos" || raw === "rowfs") return raw;
   throw new Error(
     `invalid FILE_STORE_MODE/data.fileStore: ${JSON.stringify(raw)} (expected "local" | "cos" | "rowfs")`,
@@ -495,11 +503,15 @@ export function resolveFileStoreMode(
 export function resolveFileStoreOthersMode(
   raw: string | undefined,
   deployMode: DeployMode,
+  storeMode?: string,
 ): FileStoreOthersMode {
-  if (raw === undefined) return deployMode === "service" ? "cos" : "local";
-  if (raw === "local" || raw === "cos" || raw === "mongofs") return raw;
+  if (raw === undefined) {
+    if (storeMode === "postgres") return "pgfs";
+    return deployMode === "service" ? "cos" : "local";
+  }
+  if (raw === "local" || raw === "cos" || raw === "mongofs" || raw === "pgfs") return raw;
   throw new Error(
-    `invalid FILE_STORE_OTHERS/data.fileStoreOthers: ${JSON.stringify(raw)} (expected "local" | "cos" | "mongofs")`,
+    `invalid FILE_STORE_OTHERS/data.fileStoreOthers: ${JSON.stringify(raw)} (expected "local" | "cos" | "mongofs" | "pgfs")`,
   );
 }
 
@@ -702,10 +714,12 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
   const fileStore = resolveFileStoreMode(
     env("FILE_STORE_MODE") ?? str(dataConfig, "fileStore"),
     deployMode,
+    env("STORE_MODE"),
   );
   const fileStoreOthers = resolveFileStoreOthersMode(
     env("FILE_STORE_OTHERS") ?? str(dataConfig, "fileStoreOthers"),
     deployMode,
+    env("STORE_MODE"),
   );
 
   // P9 kill switch: assembly via BackendResolver (default) vs legacy branches.

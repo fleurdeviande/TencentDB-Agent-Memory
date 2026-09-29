@@ -33,23 +33,27 @@ export type FsKind = "local" | "cos" | "rowfs";
  *
  * `profile="files"` → the others backend serves ALL keys (single-backend
  * assembly, the pre-rowfs form). `profile="rows"` → CompositeStorageBackend(
- * ProfileRowStorageBackend, others). `rows` requires `db.kind="mongodb"`.
+ * ProfileRowStorageBackend, others). `rows` requires a DB whose store serves
+ * profile rows: `db.kind` "mongodb" or "postgres".
  */
 export type FsProfileMode = "files" | "rows";
 
 /**
  * The others-leg backend kind. `mongofs` is the TCS choice: it keeps every
  * byte in the instance's own Mongo database (zero disk), and is therefore
- * only legal when `db.kind === "mongodb"` (validate.ts).
+ * only legal when `db.kind === "mongodb"` (validate.ts). `pgfs` is the same
+ * over Postgres (PostgresFSBackend, the instance schema) and needs
+ * `db.kind === "postgres"`.
  */
-export type FsOthersKind = "local" | "cos" | "mongofs";
+export type FsOthersKind = "local" | "cos" | "mongofs" | "pgfs";
 
 /**
  * sqlite/local/mongofs carry `conn: null` on purpose:
  * - sqlite/local connection info is process-level (dataDir/baseDir), not per-instance;
  * - postgres is process-level too (POSTGRES_URL); the instance picks its schema;
  * - mongofs reuses the DB dimension's MongoConfig (its chunks live in the same
- *   instance database as the memory store).
+ *   instance database as the memory store);
+ * - pgfs reuses the process-level POSTGRES_URL and the instance's schema.
  */
 export type DbChoice =
   | { kind: "sqlite"; conn: null }
@@ -60,7 +64,8 @@ export type DbChoice =
 export type FsOthersChoice =
   | { kind: "local"; conn: null }
   | { kind: "cos"; conn: CosConfig }
-  | { kind: "mongofs"; conn: null };
+  | { kind: "mongofs"; conn: null }
+  | { kind: "pgfs"; conn: null };
 
 export interface FsChoice {
   profile: FsProfileMode;

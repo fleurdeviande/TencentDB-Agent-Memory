@@ -45,7 +45,12 @@ const TAG = "[storage][composite]";
  * CompositeStorageBackend (rebinds its profile side, others leg untouched).
  */
 export interface ProfileIsolationRebindable extends IStorageBackend {
-  withProfileIsolation(isolation?: ProfileIsolation): IStorageBackend;
+  /**
+   * `othersPrefix` is the legacy `profiles/{scope}/` key prefix of the same
+   * domain; only a composite built with `scopeOthers` applies it (to its
+   * others leg), everything else ignores it.
+   */
+  withProfileIsolation(isolation?: ProfileIsolation, othersPrefix?: string): IStorageBackend;
 }
 
 /** Narrow to {@link ProfileIsolationRebindable}. */
@@ -63,6 +68,14 @@ export interface CompositeStorageBackendOptions {
    * keeping one key convention for the whole storage layer (D12).
    */
   isProfileKey?: (key: string) => boolean;
+  /**
+   * Opt-in: scope the others leg too when the view is rebound to a domain,
+   * by wrapping it in that domain's `profiles/{scope}/` prefix — the layout the
+   * local/COS modes use. Without it every domain shares one `.metadata/`
+   * (checkpoint counters, L3 scope discovery), which is right only for a
+   * single-tenant instance. Postgres assemblies set it; mongodb keeps upstream.
+   */
+  scopeOthers?: (others: IStorageBackend, prefix: string) => IStorageBackend;
   logger?: StorageLogger;
 }
 
@@ -72,34 +85,40 @@ export class CompositeStorageBackend implements IStorageBackend {
   private readonly profile: IStorageBackend;
   private readonly othersBackend: IStorageBackend;
   private readonly isProfileKey: (key: string) => boolean;
+  private readonly scopeOthers?: (others: IStorageBackend, prefix: string) => IStorageBackend;
   private readonly logger?: StorageLogger;
 
   constructor(opts: CompositeStorageBackendOptions) {
     this.profile = opts.profileBackend;
     this.othersBackend = opts.others;
     this.isProfileKey = opts.isProfileKey ?? ((key) => classifyPath(key) !== null);
+    this.scopeOthers = opts.scopeOthers;
     this.logger = opts.logger;
   }
 
   /**
    * Rebind the profile side to an isolation domain; the others leg passes
-   * through unchanged (non-profile keys carry no tenancy).
+   * through unchanged (non-profile keys carry no tenancy) unless the composite
+   * was built with `scopeOthers`, which prefixes it with `othersPrefix`.
    *
    * Throws when the profile side cannot rebind: serving a scoped request
    * through an unbound (whole-set) row view would leak across tenants, so
    * this must surface loudly at wiring time rather than silently.
    */
-  withProfileIsolation(isolation?: ProfileIsolation): CompositeStorageBackend {
+  withProfileIsolation(isolation?: ProfileIsolation, othersPrefix?: string): CompositeStorageBackend {
     if (!isProfileIsolationRebindable(this.profile)) {
       throw new Error(
         `${TAG} withProfileIsolation: profile backend (type=${this.profile.type}) cannot bind isolation — ` +
           `refusing to serve a scoped request through an unbound row view`,
       );
     }
+    // A scoped view is not rebound again, so the scoped leg carries no scopeOthers.
+    const scoped = this.scopeOthers && othersPrefix;
     return new CompositeStorageBackend({
       profileBackend: this.profile.withProfileIsolation(isolation),
-      others: this.othersBackend,
+      others: scoped ? this.scopeOthers!(this.othersBackend, othersPrefix) : this.othersBackend,
       isProfileKey: this.isProfileKey,
+      scopeOthers: scoped ? undefined : this.scopeOthers,
       logger: this.logger,
     });
   }

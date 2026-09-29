@@ -124,7 +124,10 @@ function scopedStorageForScope(storage: StorageAdapter | undefined, scope: strin
   if (storage.type === "rowfs") {
     // rowfs: 把 scope 绑进行查询；默认 scope ("global") 解不出维度，
     // undefined = 全集视图（standalone 单租户语义）。
-    return scopeProfileStorageView(storage, "", parseProfileIsolationScope(scope));
+    // The prefix matters only to a composite with scopeOthers: it must match the
+    // one L2's scopedStorage used, or L3 reads another checkpoint than L2 wrote.
+    const othersPrefix = scope === DEFAULT_PROFILE_SCOPE ? "" : profileStoragePrefixForScope(scope);
+    return scopeProfileStorageView(storage, othersPrefix, parseProfileIsolationScope(scope));
   }
   if (scope === DEFAULT_PROFILE_SCOPE) return storage;
   return createScopedStorageAdapter(storage, profileStoragePrefixForScope(scope));
