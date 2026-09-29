@@ -1,0 +1,23 @@
+# pw dev stack: PostgreSQL + pgvector for MemoryCore / MemoryKnowledge development and contract tests.
+# Usage: docker compose -f deploy/pw/docker-compose.dev.yml up -d
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: pw-tdai-postgres
+    environment:
+      POSTGRES_USER: tdai
+      POSTGRES_PASSWORD: tdai-dev   # dev only; real deployments take it from OpenBao
+      POSTGRES_DB: tdai
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pw-tdai-pgdata:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tdai -d tdai"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pw-tdai-pgdata:
