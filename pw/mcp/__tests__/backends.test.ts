@@ -91,9 +91,13 @@ describe("round trips over HTTP", () => {
       const missing = await client.callTool({ name: "code_impact", arguments: { code_graph_id: "cg-1", symbol: "x" } });
       expect(missing.isError).toBe(true);
       expect(text(missing)).toContain("/v3/code-graph/impact returned HTTP 404");
-      // The multi-tenant service rejects requests without the service-id header and team_id (400).
-      expect(knowledge.requests[0]).toMatchObject({ path: "/v3/code-graph/status", body: { code_graph_id: "cg-1", team_id: "t1" } });
+      // Code-graph queries whitelist their fields and answer 400 "unexpected field: team_id" to tenant ids;
+      // wiki routes are the opposite and need team_id. Both need the service-id header.
+      expect(knowledge.requests[0]).toMatchObject({ path: "/v3/code-graph/status" });
+      expect(knowledge.requests[0].body).toEqual({ code_graph_id: "cg-1" });
       expect(knowledge.requests[0].headers).toMatchObject({ authorization: "Bearer sk-mem-test", "x-tdai-service-id": "svc1" });
+      expect(knowledge.requests[1]).toMatchObject({ path: "/v3/wiki/page/ls", body: { wiki_id: "wiki-1", team_id: "t1" } });
+      expect(knowledge.requests[2].body).toEqual({ code_graph_id: "cg-1", symbol: "x" });
     } finally {
       await close();
       await knowledge.close();

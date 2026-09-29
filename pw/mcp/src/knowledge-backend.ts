@@ -34,13 +34,12 @@ export function createKnowledgeBackend(options: KnowledgeBackendOptions): ToolBa
   const byName = new Map<string, McpToolDef>(MCP_TOOLS.map((tool) => [tool.name, tool]));
   // Upstream types properties as Record<string, unknown>; every value is a JSON Schema object.
   const tools = MCP_TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) as Tool[];
-  const client = new KnowledgeServiceClient({
-    baseUrl: options.url,
-    apiKey: options.token,
-    ...options.identity,
-    timeoutMs: options.timeoutMs ?? 30_000,
-    fetch: options.fetch,
-  });
+  const clientOptions = { baseUrl: options.url, apiKey: options.token, timeoutMs: options.timeoutMs ?? 30_000, fetch: options.fetch };
+  const client = new KnowledgeServiceClient({ ...clientOptions, ...options.identity });
+  // Code-graph queries whitelist their body fields and reject team/user/agent ids with 400, so they get
+  // only the service id (a header); wiki routes need team_id and keep the full identity.
+  const codeGraphClient = new KnowledgeServiceClient({ ...clientOptions, serviceId: options.identity.serviceId });
+  const clientFor = (tool: McpToolDef) => (tool.endpoint.startsWith("/code-graph/") ? codeGraphClient : client);
 
   return {
     name: "knowledge",
@@ -49,7 +48,7 @@ export function createKnowledgeBackend(options: KnowledgeBackendOptions): ToolBa
       const tool = byName.get(name);
       if (!tool) return errorResult(`Unknown tool: ${name}`);
       try {
-        return toCallToolResult(await client.post(`/v3${tool.endpoint}`, args));
+        return toCallToolResult(await clientFor(tool).post(`/v3${tool.endpoint}`, args));
       } catch (error) {
         return errorResult(`Error: ${error instanceof Error ? error.message : String(error)}`);
       }
