@@ -64,7 +64,12 @@ up() {
 
 down() {
   for s in core knowledge; do
-    [[ -f "$RUN/$s.pid" ]] && kill "$(cat "$RUN/$s.pid")" 2>/dev/null || true
+    # tsx re-execs node as a child, so killing the recorded pid alone leaves the port bound.
+    if [[ -f "$RUN/$s.pid" ]]; then
+      pid="$(cat "$RUN/$s.pid")"
+      pkill -P "$pid" 2>/dev/null || true
+      kill "$pid" 2>/dev/null || true
+    fi
     rm -f "$RUN/$s.pid"
   done
   echo "services stopped (Postgres container left running: docker compose -f $HERE/docker-compose.dev.yml stop)"
