@@ -120,7 +120,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       if (ok) {
         // wiki engine manager 注册清理仍由路由负责（wikiMgr 未注入 service）；
         // 连接/元数据/磁盘四类清理已在 service.cleanupResources 内完成。
-        try { wikiMgr.remove(id); } catch (err) { console.warn(`[wiki] wikiMgr.remove(${id}) failed:`, err); }
+        try { await wikiMgr.remove(id); } catch (err) { console.warn(`[wiki] wikiMgr.remove(${id}) failed:`, err); }
         result.deleted_ids.push(id);
       } else {
         result.failed.push({ id, reason: "delete failed" });
@@ -321,7 +321,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       const result = await wikiService.rawRm(ids.service_id, ids.team_id, wikiId, filenames);
       const err = maybeWriteError(result);
       if (err) return err;
-      try { wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after raw/rm:`, e); }
+      try { await wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after raw/rm:`, e); }
       return c.json(wrapOk(result));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -410,7 +410,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       const result = await wikiService.pageWriteMany(ids.service_id, ids.team_id, wikiId, validated);
       const err = maybeWriteError(result);
       if (err) return err;
-      try { wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after page/write:`, e); }
+      try { await wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after page/write:`, e); }
       return c.json(wrapOk({ items: result }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -437,7 +437,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       const result = await wikiService.pageRm(ids.service_id, ids.team_id, wikiId, refs);
       const err = maybeWriteError(result);
       if (err) return err;
-      try { wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after page/rm:`, e); }
+      try { await wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after page/rm:`, e); }
       return c.json(wrapOk(result));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -460,7 +460,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     if (row.status !== "ready") {
       return c.json(wrapOk({ nodes: [], edges: [], communities: [] }));
     }
-    const graphData = wikiMgr.graph(wikiId);
+    const graphData = await wikiMgr.graph(wikiId);
     return c.json(wrapOk(graphData));
   });
 
@@ -508,7 +508,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       minScore = body.minScore;
     }
 
-    const response = wikiMgr.search(wikiId, query, limit, { hop, decay, minScore });
+    const response = await wikiMgr.search(wikiId, query, limit, { hop, decay, minScore });
     return c.json(wrapOk(response));
   });
 

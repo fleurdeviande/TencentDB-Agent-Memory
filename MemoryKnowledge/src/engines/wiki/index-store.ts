@@ -78,9 +78,22 @@ export interface WikiIndexWriter {
   deleteSources(filenames: string[]): Promise<void>;
 }
 
+/** SQLite: the wiki's index.db cannot be opened (never created / removed). Callers treat it as empty, as upstream did. */
+export class WikiIndexMissingError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "WikiIndexMissingError";
+  }
+}
+
+export function isWikiIndexMissing(err: unknown): err is WikiIndexMissingError {
+  return err instanceof WikiIndexMissingError;
+}
+
 /**
  * `wikiId` keys the Postgres rows and the SQLite read pool; `wikiDir` locates the SQLite file.
- * SQLite readers throw when index.db is missing (upstream semantics; callers treat it as empty).
+ * SQLite readers throw WikiIndexMissingError when index.db is missing; Postgres readers return empty
+ * results for an unknown wiki and let real database errors through.
  */
 export interface WikiIndexStore {
   readonly dialect: "sqlite" | "postgres";
@@ -149,6 +162,14 @@ class SqliteWikiIndexStore implements WikiIndexStore {
   readonly dialect = "sqlite" as const;
   private readonly locks = new KeyedLock();
 
+  private read(wikiId: string, wikiDir: string): Database.Database {
+    try {
+      return getReadDb(wikiId, wikiDir);
+    } catch (err) {
+      throw new WikiIndexMissingError(err);
+    }
+  }
+
   async init(_wikiId: string, wikiDir: string): Promise<void> {
     initIndexDb(wikiDir);
   }
@@ -181,7 +202,7 @@ class SqliteWikiIndexStore implements WikiIndexStore {
    */
   async search(wikiId: string, wikiDir: string, tokens: string[], limit: number) {
     if (tokens.length === 0) return [];
-    const db = getReadDb(wikiId, wikiDir);
+    const db = this.read(wikiId, wikiDir);
     const expr = tokens.map((t) => `"${t.replace(/"/g, '""')}"*`).join(" OR ");
     const rows = db
       .prepare(
@@ -192,21 +213,21 @@ class SqliteWikiIndexStore implements WikiIndexStore {
   }
 
   async loadPages(wikiId: string, wikiDir: string): Promise<PageMetaRow[]> {
-    return getReadDb(wikiId, wikiDir)
+    return this.read(wikiId, wikiDir)
       .prepare("SELECT page_id, title, type, rel_path, snippet FROM page_meta ORDER BY page_id")
       .all() as PageMetaRow[];
   }
 
   async loadEdges(wikiId: string, wikiDir: string): Promise<EdgeRow[]> {
-    return getReadDb(wikiId, wikiDir).prepare("SELECT source_id, target_id FROM graph_edge").all() as EdgeRow[];
+    return this.read(wikiId, wikiDir).prepare("SELECT source_id, target_id FROM graph_edge").all() as EdgeRow[];
   }
 
   async listSources(wikiId: string, wikiDir: string): Promise<SourceRow[]> {
-    return sqliteListSources(getReadDb(wikiId, wikiDir));
+    return sqliteListSources(this.read(wikiId, wikiDir));
   }
 
   async readSourceStates(wikiId: string, wikiDir: string): Promise<SourceStates> {
-    return sqliteReadSourceStates(getReadDb(wikiId, wikiDir));
+    return sqliteReadSourceStates(this.read(wikiId, wikiDir));
   }
 
   async release(wikiId: string): Promise<void> {

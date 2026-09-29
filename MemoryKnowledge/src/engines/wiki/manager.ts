@@ -7,12 +7,14 @@
  * wiki 私有的 `index.db`（SQLite：wiki_fts + page_meta + graph_edge）。写走独立事务连接
  * （重建三表），读走 LRU 连接池；内存与 wiki 总数解耦，根治 MiniSearch 全量常驻的 OOM。
  * 图谱小，查询时从 graph_edge 临时构建内存 graphology 实例做多跳 BFS（复用现有算法）。
+ *
+ * The index sits behind WikiIndexStore (index-store.ts): upstream's index.db by default, Postgres rows
+ * when the metadata DB is Postgres. Manager methods that touch it are async.
  */
 
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "fs";
 import { join, basename, relative } from "path";
 import Graph from "graphology";
-import type DatabaseType from "better-sqlite3";
 import pLimit, { type LimitFunction } from "p-limit";
 import type {
   WikiPage,
@@ -27,18 +29,8 @@ import type {
   ResultLink,
 } from "./types.js";
 import { graphMultiHopSearch } from "./graph-search.js";
-import {
-  initIndexDb,
-  getReadDb,
-  withWriteDb,
-  evictWikiDb,
-  readSourceStates,
-  recordSourceIngestResult,
-  deleteSources,
-  classifySources,
-  sha256,
-  type SourceStatus,
-} from "./index-db.js";
+import { classifySources, sha256, type SourceStatus } from "./index-db.js";
+import { isWikiIndexMissing, sqliteWikiIndex, type IndexPageRow, type WikiIndexStore, type WikiIndexWriter } from "./index-store.js";
 import { createLogger } from "../../logger.js";
 import { withSpan } from "../../telemetry.js";
 import { getIngestConcurrency } from "../../config.js";
@@ -153,17 +145,22 @@ export interface IngestExecOptions {
 }
 
 export interface WikiSourceManager {
-  register(config: WikiSourceConfig): WikiSourceState;
-  sync(name: string): WikiSourceState;
+  register(config: WikiSourceConfig): Promise<WikiSourceState>;
+  sync(name: string): Promise<WikiSourceState>;
   get(name: string): WikiSourceState | undefined;
   list(): WikiSourceState[];
-  remove(name: string): void;
-  search(name: string, query: string, limit?: number, options?: SearchOptions): SearchResponse;
-  graph(name: string): { nodes: GraphNode[]; edges: GraphEdge[]; communities: CommunityInfo[] };
+  remove(name: string): Promise<void>;
+  search(name: string, query: string, limit?: number, options?: SearchOptions): Promise<SearchResponse>;
+  graph(name: string): Promise<{ nodes: GraphNode[]; edges: GraphEdge[]; communities: CommunityInfo[] }>;
   readPage(name: string, relPath: string): string | null;
   getPages(name: string): WikiPage[];
-  init(config: WikiSourceConfig): WikiSourceState;
+  init(config: WikiSourceConfig): Promise<WikiSourceState>;
   ingest(name: string, llmConfig: any, opts?: IngestExecOptions): Promise<any[]>;
+}
+
+export interface WikiSourceManagerOptions {
+  /** Where the per-wiki index lives; default upstream's index.db. */
+  index?: WikiIndexStore;
 }
 
 /** 图谱中不参与建边/展示的页类型（如内部 query 页）。 */
@@ -303,7 +300,7 @@ function resolveTarget(
   return null;
 }
 
-// ── Search Engine (SQLite FTS5) ──
+// ── Search Engine (WikiIndexStore: SQLite FTS5 / Postgres tsvector) ──
 
 const STOP_WORDS = new Set([
   "的", "是", "了", "什么", "在", "有", "和", "与", "对", "从",
@@ -373,49 +370,39 @@ export function tokenize(text: string): string[] {
   return result;
 }
 
-/**
- * FTS5 检索：query → tokenize → 每 token 加 `*` 前缀 → OR 连接 → MATCH。
- * bm25() 越负越相关，取负转成"越大越相关"的正分，供图扩展的 decay/minScore 使用。
- * title_tok 权重 5.0、content_tok 1.0（对齐原 MiniSearch boost title×5）。
- */
-function ftsSearch(db: DatabaseType.Database, query: string, limit: number): Array<{ id: string; score: number }> {
-  const toks = tokenize(query);
-  if (toks.length === 0) return [];
-  const expr = toks.map((t) => `"${t.replace(/"/g, '""')}"*`).join(" OR ");
-  const rows = db
-    .prepare(
-      "SELECT page_id, bm25(wiki_fts, 5.0, 1.0) AS score FROM wiki_fts WHERE wiki_fts MATCH ? ORDER BY score LIMIT ?",
-    )
-    .all(expr, limit) as Array<{ page_id: string; score: number }>;
-  return rows.map((r) => ({ id: r.page_id, score: -r.score }));
+/** 全文检索：query → tokenize → 各后端构造前缀 OR 表达式（SQLite FTS5 bm25 / Postgres ts_rank_cd）。 */
+function ftsSearch(
+  index: WikiIndexStore,
+  name: string,
+  dir: string,
+  query: string,
+  limit: number,
+): Promise<Array<{ id: string; score: number }>> {
+  return index.search(name, dir, tokenize(query), limit);
 }
 
-/** 事务内重建三张索引表（wiki_fts + page_meta + graph_edge）。由 withWriteDb 调用。 */
-function writeIndex(db: DatabaseType.Database, pages: WikiPage[]): void {
-  db.prepare("DELETE FROM wiki_fts").run();
-  db.prepare("DELETE FROM page_meta").run();
-  db.prepare("DELETE FROM graph_edge").run();
-
-  const insFts = db.prepare("INSERT INTO wiki_fts(page_id, title_tok, content_tok) VALUES (?,?,?)");
-  const insMeta = db.prepare(
-    "INSERT INTO page_meta(page_id, title, type, rel_path, snippet) VALUES (?,?,?,?,?)",
-  );
-  const insEdge = db.prepare("INSERT OR IGNORE INTO graph_edge(source_id, target_id) VALUES (?,?)");
-
-  for (const p of pages) {
-    // wiki_fts + page_meta 收录所有页（含 hidden 类型，供检索）。
-    insFts.run(p.id, tokenize(p.title).join(" "), tokenize(p.content).join(" "));
-    insMeta.run(p.id, p.title, p.type, p.relPath, makeSnippet(p));
-  }
-  // graph_edge 只在 visible 页间。
-  for (const e of resolveEdges(pages)) insEdge.run(e.source, e.target);
+/** 事务内重建三张索引表（wiki_fts + page_meta + graph_edge）。由 withWrite 调用。 */
+function writeIndex(w: WikiIndexWriter, pages: WikiPage[]): Promise<void> {
+  // wiki_fts + page_meta 收录所有页（含 hidden 类型，供检索）；graph_edge 只在 visible 页间。
+  const rows: IndexPageRow[] = pages.map((p) => ({
+    page_id: p.id,
+    title: p.title,
+    type: p.type,
+    rel_path: p.relPath,
+    snippet: makeSnippet(p),
+    title_tok: tokenize(p.title).join(" "),
+    content_tok: tokenize(p.content).join(" "),
+  }));
+  return w.replacePages(rows, resolveEdges(pages));
 }
 
-/** 从读连接加载读模型：页元数据表 + 图（graph_edge 构建的内存图）。 */
-function loadReadModel(db: DatabaseType.Database): { pg: PageGraph; metaById: Map<string, PageMeta> } {
-  const metaRows = db
-    .prepare("SELECT page_id, title, type, rel_path, snippet FROM page_meta ORDER BY page_id")
-    .all() as Array<{ page_id: string; title: string | null; type: string | null; rel_path: string | null; snippet: string | null }>;
+/** 加载读模型：页元数据表 + 图（graph_edge 构建的内存图）。 */
+async function loadReadModel(
+  index: WikiIndexStore,
+  name: string,
+  dir: string,
+): Promise<{ pg: PageGraph; metaById: Map<string, PageMeta> }> {
+  const metaRows = await index.loadPages(name, dir);
   const metaById = new Map<string, PageMeta>();
   for (const r of metaRows) {
     metaById.set(r.page_id, {
@@ -426,10 +413,7 @@ function loadReadModel(db: DatabaseType.Database): { pg: PageGraph; metaById: Ma
       snippet: r.snippet ?? "",
     });
   }
-  const edgeRows = db.prepare("SELECT source_id, target_id FROM graph_edge").all() as Array<{
-    source_id: string;
-    target_id: string;
-  }>;
+  const edgeRows = await index.loadEdges(name, dir);
   const pg = buildPageGraphFromDb(metaById, edgeRows);
   return { pg, metaById };
 }
@@ -792,7 +776,11 @@ function findMdFiles(dir: string): string[] {
 
 // ── Factory ──
 
-export function createWikiSourceManager(dataDir: string): WikiSourceManager {
+export async function createWikiSourceManager(
+  dataDir: string,
+  opts: WikiSourceManagerOptions = {},
+): Promise<WikiSourceManager> {
+  const index = opts.index ?? sqliteWikiIndex;
   const sources = new Map<string, WikiSourceState>();
   const stateFile = join(dataDir, "wiki-sources.json");
 
@@ -839,25 +827,17 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
   }
 
   /** 重建 wiki 的 index.db 索引（幂等建库 → 事务重建三表 → 驱逐读连接防 stale）。 */
-  function rebuildIndex(name: string, pages: WikiPage[]) {
+  async function rebuildIndex(name: string, pages: WikiPage[]) {
     const state = sources.get(name);
     if (!state) throw new Error(`rebuildIndex: unknown wiki ${name}`);
-    initIndexDb(state.path); // 幂等：首次注册即建库+4表；已存在则无操作
-    withWriteDb(state.path, (db) => writeIndex(db, pages));
-    evictWikiDb(name); // 丢弃可能持有旧快照的读连接，下次查询重开
+    await index.init(name, state.path); // 幂等：首次注册即建库+4表；已存在则无操作
+    await index.withWrite(name, state.path, (w) => writeIndex(w, pages));
+    await index.release(name); // 丢弃可能持有旧快照的读连接，下次查询重开
   }
 
-  function searchInternal(name: string, query: string, limit: number, options: SearchOptions): SearchResponse {
+  async function searchInternal(name: string, query: string, limit: number, options: SearchOptions): Promise<SearchResponse> {
     const state = sources.get(name);
     if (!state) return { results: [], links: [], count: 0 };
-
-    let db: DatabaseType.Database;
-    try {
-      db = getReadDb(name, state.path);
-    } catch {
-      // 库不存在（wiki 未 ingest/未建索引）→ 返回空，与旧"无引擎"行为一致。
-      return { results: [], links: [], count: 0 };
-    }
 
     const hop = clamp(options.hop ?? DEFAULT_HOP, 0, HOP_LIMIT);
     const decay = clamp(options.decay ?? DEFAULT_DECAY, 0, 1);
@@ -867,12 +847,20 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     // Pull a slightly oversized seed pool so graph expansion still has something
     // to walk from when `limit` is small but `hop>0` is requested.
     const seedPoolSize = Math.max(finalLimit, hop > 0 ? finalLimit * 2 : finalLimit);
-    const rawSeeds = ftsSearch(db, query, seedPoolSize);
-    if (rawSeeds.length === 0) {
+    let rawSeeds: Array<{ id: string; score: number }>;
+    let model: Awaited<ReturnType<typeof loadReadModel>>;
+    try {
+      rawSeeds = await ftsSearch(index, name, state.path, query, seedPoolSize);
+      if (rawSeeds.length === 0) {
+        return { results: [], links: [], count: 0 };
+      }
+      model = await loadReadModel(index, name, state.path);
+    } catch (err) {
+      if (!isWikiIndexMissing(err)) throw err;
+      // 库不存在（wiki 未 ingest/未建索引）→ 返回空，与旧"无引擎"行为一致。
       return { results: [], links: [], count: 0 };
     }
-
-    const { pg, metaById } = loadReadModel(db);
+    const { pg, metaById } = model;
 
     let hits: { id: string; score: number; hop: number; via?: string }[];
     if (hop === 0) {
@@ -927,7 +915,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     }
     try {
       const pages = scanWikiDir(state.path);
-      rebuildIndex(name, pages);
+      await rebuildIndex(name, pages);
       restored++;
       log.info("Restored wiki index", { name, pageCount: pages.length });
     } catch (err) {
@@ -939,28 +927,28 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
   }
   log.info("Wiki restore complete", { restored, failed, total: sources.size });
 
-  function register(config: WikiSourceConfig): WikiSourceState {
+  async function register(config: WikiSourceConfig): Promise<WikiSourceState> {
     const existing = sources.get(config.name);
     if (existing) return existing;
     const state: WikiSourceState = { name: config.name, path: config.path, status: "scanning" };
     sources.set(config.name, state);
     try {
       const pages = scanWikiDir(config.path);
-      rebuildIndex(config.name, pages);
+      await rebuildIndex(config.name, pages);
       state.status = "ready"; state.pageCount = pages.length; state.lastSyncAt = new Date().toISOString();
     } catch (err) { state.status = "error"; state.error = String(err); }
     persist();
     return state;
   }
 
-  function sync(name: string): WikiSourceState {
+  async function sync(name: string): Promise<WikiSourceState> {
     const state = sources.get(name);
     if (!state) throw new Error(`Not found: ${name}`);
     state.status = "scanning";
     const t0 = Date.now();
     try {
       const pages = scanWikiDir(state.path);
-      rebuildIndex(name, pages);
+      await rebuildIndex(name, pages);
       state.status = "ready"; state.pageCount = pages.length; state.lastSyncAt = new Date().toISOString(); state.error = undefined;
       log.info("sync 完成（索引已重建）", { name, pageCount: pages.length, ms: Date.now() - t0 });
     } catch (err) {
@@ -971,7 +959,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     return state;
   }
 
-  function init(config: WikiSourceConfig): WikiSourceState {
+  function init(config: WikiSourceConfig): Promise<WikiSourceState> {
     initWikiProject(config.path);
     return register(config);
   }
@@ -980,13 +968,14 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     const state = sources.get(name);
     if (!state) throw new Error(`Not found: ${name}`);
     const projectPath = state.path;
-    initIndexDb(projectPath); // 确保 index.db 存在（register 通常已建，幂等）
+    await index.init(name, projectPath); // 确保 index.db 存在（register 通常已建，幂等）
 
     // 读上次 source 状态（增量判断基线）——须在抽取前读取。
     let oldStates = new Map<string, { sha256: string; status: SourceStatus }>();
     try {
-      oldStates = readSourceStates(getReadDb(name, projectPath));
-    } catch {
+      oldStates = await index.readSourceStates(name, projectPath);
+    } catch (err) {
+      if (!isWikiIndexMissing(err)) throw err;
       /* 库刚建 / 无 source 行 → 全部视为新增 */
     }
 
@@ -1006,12 +995,12 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     const t0 = Date.now();
     try {
       const pages = scanWikiDir(projectPath);
-      withWriteDb(projectPath, (db) => {
-        writeIndex(db, pages);
-        for (const p of outcome.processed) recordSourceIngestResult(db, p);
-        if (outcome.deletedSources.length > 0) deleteSources(db, outcome.deletedSources);
+      await index.withWrite(name, projectPath, async (w) => {
+        await writeIndex(w, pages);
+        for (const p of outcome.processed) await w.recordSourceIngestResult(p);
+        if (outcome.deletedSources.length > 0) await w.deleteSources(outcome.deletedSources);
       });
-      evictWikiDb(name); // 丢弃可能持旧快照的读连接
+      await index.release(name); // 丢弃可能持旧快照的读连接
 
       const attempted = outcome.processed.length;
       const failed = outcome.processed.filter((p) => !p.ok);
@@ -1048,22 +1037,20 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     register, sync, init, ingest,
     get: (name) => sources.get(name),
     list: () => [...sources.values()],
-    remove: (name) => {
-      const state = sources.get(name);
+    remove: async (name) => {
       sources.delete(name);
-      // 先关读连接（内部 checkpoint+close），目录 rmSync 由调用方（wiki-service/route）负责。
-      evictWikiDb(name);
-      if (state) { /* index.db 随目录删除一并清理 */ }
       persist();
+      // 先关读连接（内部 checkpoint+close）；index.db 随目录删除、Postgres 行由 WikiService.delete 的 drop 清理。
+      await index.release(name);
     },
     search: (name, query, limit, options) => searchInternal(name, query, limit ?? DEFAULT_LIMIT, options ?? {}),
-    graph: (name) => {
+    graph: async (name) => {
       const state = sources.get(name);
       if (!state) return { nodes: [], edges: [], communities: [] };
       try {
-        const db = getReadDb(name, state.path);
-        return loadReadModel(db).pg.view;
-      } catch {
+        return (await loadReadModel(index, name, state.path)).pg.view;
+      } catch (err) {
+        if (!isWikiIndexMissing(err)) throw err;
         return { nodes: [], edges: [], communities: [] };
       }
     },

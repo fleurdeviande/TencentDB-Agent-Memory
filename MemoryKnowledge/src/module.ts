@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { mkdirSync, existsSync, rmSync } from "node:fs";
 import pLimit from "p-limit";
 
-import type { Db, KnowledgeDb } from "./db/client.js";
+import { asKnowledgeDb, type Db, type KnowledgeDb } from "./db/client.js";
 import { SqliteKnowledgeStore, type IKnowledgeStore } from "./store/index.js";
 import { WikiService, type WikiWorker } from "./store/index.js";
 import { CodeGraphService, type CodeGraphWorker } from "./store/index.js";
@@ -22,6 +22,7 @@ import {
   type ILlmBindingStore,
 } from "./store/llm-binding-store.js";
 import { createWikiSourceManager, type WikiSourceManager } from "./engines/wiki/index.js";
+import { createWikiIndexStore } from "./engines/wiki/index-store.js";
 import { indexProject, openIndex, syncIndex, getStats, closeIndex, type CodeGraphInstance } from "./engines/code/index.js";
 import {
   SourceFetcherRegistry,
@@ -155,8 +156,9 @@ export async function createKnowledgeModule(config: KnowledgeModuleConfig): Prom
     },
   };
 
-  // Wiki engine manager
-  const wikiMgr = createWikiSourceManager(join(dataDir, "_wiki_engines"));
+  // Wiki engine manager; its index lives in the metadata DB when that is Postgres, else per-wiki index.db.
+  const wikiIndex = createWikiIndexStore(asKnowledgeDb(db));
+  const wikiMgr = await createWikiSourceManager(join(dataDir, "_wiki_engines"), { index: wikiIndex });
 
   // Source fetcher registry (git/local/ftp routing + security validation)
   const fetcherRegistry = new SourceFetcherRegistry({
@@ -260,7 +262,7 @@ export async function createKnowledgeModule(config: KnowledgeModuleConfig): Prom
     const onProgress = config.tmcCallbackUrl
       ? buildProgressFn(config.tmcCallbackUrl, wikiId, serviceId, teamId, ingestRunId)
       : undefined;
-    wikiMgr.init({ name: wikiId, path: dir });
+    await wikiMgr.init({ name: wikiId, path: dir });
     await wikiMgr.ingest(
       wikiId,
       {
@@ -291,6 +293,7 @@ export async function createKnowledgeModule(config: KnowledgeModuleConfig): Prom
     store,
     dataRoot: dataDir,
     worker: config.wikiWorker ?? realWikiWorker,
+    wikiIndex,
     queue: sharedQueue,
     logger: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
     callbackConfig,
@@ -350,7 +353,7 @@ export async function createKnowledgeModule(config: KnowledgeModuleConfig): Prom
       for (const row of allSyncedWikis) {
         const dir = join(dataDir, row.service_id, row.team_id, row.wiki_id);
         try {
-          wikiMgr.init({ name: row.wiki_id, path: dir });
+          await wikiMgr.init({ name: row.wiki_id, path: dir });
           const pages = wikiMgr.getPages(row.wiki_id);
           if (pages.length > 0) {
             await store.updateWikiStatus(row.service_id, row.wiki_id, { page_count: pages.length });
