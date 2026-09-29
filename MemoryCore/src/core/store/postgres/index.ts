@@ -8,9 +8,11 @@ import type { StoreLogger } from "../types.js";
 import { createEmbeddingService, NoopEmbeddingService } from "../embedding.js";
 import type { EmbeddingService } from "../embedding.js";
 import { PostgresMemoryStore } from "./memory-store.js";
+import { PostgresSkillStore } from "./skill-store.js";
 import { describePostgresUrl, resolvePostgresStoreConfig, schemaForInstance } from "./config.js";
 
 export { PostgresMemoryStore } from "./memory-store.js";
+export { PostgresSkillStore } from "./skill-store.js";
 export { closeSharedPostgresPools, getSharedPostgresPool } from "./client.js";
 export { describePostgresUrl, resolvePostgresStoreConfig, schemaForInstance } from "./config.js";
 
@@ -61,4 +63,17 @@ export function createPostgresStoreForInstance(
   const dims = config.embedding.provider === "none" ? 0 : (config.embedding.dimensions ?? 0);
   const store = new PostgresMemoryStore({ url, schema, dimensions: dims, logger });
   return { store, url, schema, endpoint: describePostgresUrl(url) };
+}
+
+/** Skill store for one instance, in the same schema as its memory store. Throws when no URL is configured. */
+export function createPostgresSkillStoreForInstance(
+  config: MemoryTdaiConfig,
+  instanceId: string,
+  logger?: StoreLogger,
+): PostgresSkillStore {
+  const { url, schema: baseSchema } = resolvePostgresStoreConfig(config.postgres);
+  if (!url) {
+    throw new Error("[postgres] store backend 'postgres' requires POSTGRES_URL (or memory.postgres.url)");
+  }
+  return new PostgresSkillStore({ url, schema: schemaForInstance(baseSchema, instanceId), logger });
 }

@@ -86,7 +86,7 @@ describe.skipIf(!reachable)("PostgresMemoryStore lifecycle", () => {
     const store = newStore();
     await store.init();
     const nasty = `'); DROP TABLE l1_records; -- "quoted" \\ back`;
-    expect(await store.upsertL1(l1("q1", nasty, { teamId: "t'1", agentId: "a\"1" }))).toBe(true);
+    expect(await store.upsertL1(l1("q1", nasty, { teamId: "t'1", agentId: 'a"1' }))).toBe(true);
     const [row] = await store.queryL1Records({ teamId: "t'1", agentId: 'a"1' });
     expect(row.content).toBe(nasty);
     const hits = await store.searchL1Fts(`"DROP" OR "'); --"`, 5, { teamId: "t'1" });

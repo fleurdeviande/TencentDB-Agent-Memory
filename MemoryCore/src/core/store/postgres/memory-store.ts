@@ -278,6 +278,11 @@ export class PostgresMemoryStore implements IMemoryStore {
     return this.schema;
   }
 
+  /** The shared pool, so co-located stores (skills) reuse the connection pool. */
+  getPool(): Pool {
+    return this.pool;
+  }
+
   // ════════════════════════════ Lifecycle ════════════════════════════
 
   init(providerInfo?: EmbeddingProviderInfo): Promise<StoreInitResult> {
@@ -381,15 +386,15 @@ export class PostgresMemoryStore implements IMemoryStore {
     // A Noop embedder (provider "noop") produces no vectors and must not pin the contract.
     const current: EmbeddingMeta | null =
       providerInfo && providerInfo.provider !== "noop"
-      ? {
-          provider: providerInfo.provider,
-          model: providerInfo.model,
-          dimensions: this.dimensions,
-          schemaIdentity: providerInfo.schemaIdentity,
-          modelRevision: providerInfo.modelRevision,
-          normalization: providerInfo.normalization ?? "l2-v1",
-        }
-      : null;
+        ? {
+            provider: providerInfo.provider,
+            model: providerInfo.model,
+            dimensions: this.dimensions,
+            schemaIdentity: providerInfo.schemaIdentity,
+            modelRevision: providerInfo.modelRevision,
+            normalization: providerInfo.normalization ?? "l2-v1",
+          }
+        : null;
     const savedRaw = await this.readMeta("embedding_provider_info");
     const saved: EmbeddingMeta | null = savedRaw ? JSON.parse(savedRaw) : null;
 

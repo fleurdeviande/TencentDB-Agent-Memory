@@ -1059,7 +1059,7 @@ export class TdaiGateway {
         // 复用 Memory 侧的 COS adapter，创建 per-instance SkillCore。
         // Skill queue + worker 如果已在 tdai-core 中启动则复用；否则
         // service 模式下可在此处单独启动。
-        if (storePool.mode === "tcvdb" || storePool.mode === "mongodb") {
+        if (storePool.mode === "tcvdb" || storePool.mode === "mongodb" || storePool.mode === "postgres") {
           // per-instance resolvers 抽到了私有方法（同一份实现被 handler 和 skill worker 共用）。
           // tcvdb: TcvdbSkillStore + COS storage；mongodb: MongoSkillStore + (standalone) LocalStorage / (service) COS。
           skillDeps.resolveSkillCore = (instanceId: string) => this.resolveSkillCoreForInstance(instanceId);
@@ -1075,7 +1075,7 @@ export class TdaiGateway {
         //   - handleConversationAdd 用 .handler
         //   - handleExtract 用 .trigger (direct-trigger)
         skillDeps.resolveConversationAdd = async (instanceId: string) => {
-          const wired = storePool.mode === "tcvdb" || storePool.mode === "mongodb"
+          const wired = storePool.mode === "tcvdb" || storePool.mode === "mongodb" || storePool.mode === "postgres"
             ? await this.ensureConversationAddForInstance(instanceId)
             : await this.ensureConversationAddForStandalone(instanceId);
           return wired;
@@ -2450,7 +2450,7 @@ export class TdaiGateway {
     //     MongoSkillStore). This holds even for standalone + STORE_MODE=mongodb.
     //   - otherwise (sqlite singleton) → TdaiCore's standalone SkillExtractor.
     const usePerInstanceSkill =
-      this.storePool?.mode === "tcvdb" || this.storePool?.mode === "mongodb";
+      this.storePool?.mode === "tcvdb" || this.storePool?.mode === "mongodb" || this.storePool?.mode === "postgres";
 
     this.skillWorkerPool = new SkillWorkerPool({
       concurrency: skillCfg.worker.concurrency,

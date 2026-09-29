@@ -31,6 +31,7 @@ import type { MongoClientPool } from "./mongodb/client-pool.js";
 import {
   closeSharedPostgresPools,
   createPostgresEmbeddingService,
+  createPostgresSkillStoreForInstance,
   createPostgresStoreForInstance,
   resolvePostgresStoreConfig,
   schemaForInstance,
@@ -411,6 +412,15 @@ export class StorePool {
       this.skillStoreAccessTimes.set(key, Date.now());
       this.logger.info(`${TAG} Created mongo skill store for ${instanceId}: ${mongoConfig.endpoint}/${mongoConfig.database} (cached: ${this.skillStoreCache.size})`);
       return mongoStore;
+    }
+
+    if (this.mode === "postgres" && !vdbConfig) {
+      const pgStore = createPostgresSkillStoreForInstance(this.memoryCfg, instanceId, this.logger as StoreLogger);
+      pgStore.init();
+      this.skillStoreCache.set(key, pgStore);
+      this.skillStoreAccessTimes.set(key, Date.now());
+      this.logger.info(`${TAG} Created postgres skill store for ${instanceId}: schema ${pgStore.getSchema()} (cached: ${this.skillStoreCache.size})`);
+      return pgStore;
     }
 
     if (!vdbConfig) {
