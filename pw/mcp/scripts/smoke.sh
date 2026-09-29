@@ -96,6 +96,25 @@ CAPTURED="$(curl -sf -X POST "$CORE_URL/v3/conversation/search" -H "Authorizatio
 echo "$CAPTURED" | grep -q "sglang-v516" || fail "Stop capture not found in L0: $CAPTURED"
 echo "  PASS Stop hook captured the turn (found in L0 via /v3/conversation/search)"
 
+echo "== personal key: identity derived from the key, no TDAI_USER_ID"
+PKEY="sk-mem-smokeuser$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+curl -sf -X POST "$CORE_URL/v3/internal/meta/user/init-admin" -H "Authorization: Bearer $KEY" -H "x-tdai-service-id: default" \
+  -H "Content-Type: application/json" -d "{\"username\":\"smoke-admin\",\"user_key\":\"$PKEY\"}" >"$WORK/init-admin.json" \
+  || fail "init-admin failed"
+env -i PATH="$PATH" HOME="$WORK/home" PW_MEMORY_CONFIG="$WORK/home/none.json" TDAI_CLAUDE_CODE_STATE_DIR="$WORK/pstate" \
+  TDAI_URL="$CORE_URL" TDAI_USER_KEY="$PKEY" SMOKE_SERVER="$HERE/dist/server.js" SMOKE_EXPECT_TOOLS="$MEMORY_TOOLS" \
+  node "$HERE/scripts/smoke-client.mjs" >"$WORK/pmcp.json" 2>"$WORK/pmcp.err" || true
+node -e 'process.exit(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).ok?0:1)' "$WORK/pmcp.json" \
+  || fail "mcp with a personal key: $(cat "$WORK/pmcp.json")"
+# smoke-client puts the server's stderr (the startup notes) into its JSON summary.
+grep -q "identity from TDAI_USER_KEY: user usr-" "$WORK/pmcp.json" || fail "identity not derived: $(cat "$WORK/pmcp.json")"
+TEAM="$(sed -n 's/.*identity from TDAI_USER_KEY: user [^,]*, team \([^ "]*\).*/\1/p' "$WORK/pmcp.json" | head -1)"
+SPOOF="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$CORE_URL/v3/conversation/search" -H "Authorization: Bearer $PKEY" \
+  -H "x-tdai-service-id: default" -H "Content-Type: application/json" \
+  -d "{\"team_id\":\"$TEAM\",\"agent_id\":\"default\",\"user_id\":\"smoke\",\"query\":\"sglang-v516\",\"limit\":5}")"
+[ "$SPOOF" = "403" ] || fail "spoofed user_id with a personal key answered $SPOOF, expected 403"
+echo "  PASS memory write/read-back as the key's user in team $TEAM; spoofed user_id refused (403)"
+
 echo "== install / uninstall against a throwaway HOME with a stub claude"
 mkdir -p "$WORK/home/.claude" "$WORK/bin"
 echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"say done"}]}]}}' >"$WORK/home/.claude/settings.json"

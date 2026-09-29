@@ -51,7 +51,9 @@ fi
 #                             （mongod + mongot 一体，数据卷 mongo-local-* 持久化）
 #
 # 元数据后端（meta_* 团队/用户/agent/task/ACL）：
-#   MEMORY_CORE_METADATA_BACKEND=auto（默认，跟随 STORE_MODE）/ sqlite / mongodb
+#   MEMORY_CORE_METADATA_BACKEND=auto（默认，跟随 STORE_MODE）/ sqlite / mongodb / postgres
+#   postgres: same POSTGRES_URL as the data plane (TDAI_METADATA_POSTGRES_URL overrides),
+#   schema TDAI_METADATA_POSTGRES_SCHEMA (default tdai_metadata).
 #   mongodb 时默认复用同一个 Mongo（TDAI_METADATA_MONGO_URI 可另行覆盖）；
 #   元数据用多文档事务，目标必须是副本集（atlas-local 单节点 RS 满足）。
 MEMORY_CORE_STORE_MODE="${MEMORY_CORE_STORE_MODE:-sqlite}"
@@ -64,6 +66,8 @@ MONGO_ENV_ARGS=()
 if [[ "$MEMORY_CORE_METADATA_BACKEND" == "auto" ]]; then
   if [[ "$MEMORY_CORE_STORE_MODE" == "mongodb" ]]; then
     MEMORY_CORE_METADATA_BACKEND="mongodb"
+  elif [[ "$MEMORY_CORE_STORE_MODE" == "postgres" ]]; then
+    MEMORY_CORE_METADATA_BACKEND="postgres"
   else
     MEMORY_CORE_METADATA_BACKEND="sqlite"
   fi
@@ -116,6 +120,17 @@ if [[ "$MEMORY_CORE_STORE_MODE" == "postgres" ]]; then
   [[ -n "${POSTGRES_SCHEMA:-}" ]] && PG_ENV_ARGS+=( -e "POSTGRES_SCHEMA=$POSTGRES_SCHEMA" )
   info "memory-core data plane = postgres (schema=${POSTGRES_SCHEMA:-tdai})"
 fi
+if [[ "$MEMORY_CORE_METADATA_BACKEND" == "postgres" ]]; then
+  PG_META_URL="${TDAI_METADATA_POSTGRES_URL:-${POSTGRES_URL:-}}"
+  [[ -n "$PG_META_URL" ]] || die "MEMORY_CORE_METADATA_BACKEND=postgres requires POSTGRES_URL or TDAI_METADATA_POSTGRES_URL"
+  PG_ENV_ARGS+=( -e "TDAI_METADATA_POSTGRES_URL=$PG_META_URL" )
+  [[ -n "${TDAI_METADATA_POSTGRES_SCHEMA:-}" ]] && PG_ENV_ARGS+=( -e "TDAI_METADATA_POSTGRES_SCHEMA=$TDAI_METADATA_POSTGRES_SCHEMA" )
+fi
+# Tell the gateway explicitly whenever postgres is involved: its own "auto" would put
+# metadata on postgres for STORE_MODE=postgres even when sqlite was chosen here.
+if [[ "$MEMORY_CORE_STORE_MODE" == "postgres" || "$MEMORY_CORE_METADATA_BACKEND" == "postgres" ]]; then
+  PG_ENV_ARGS+=( -e "TDAI_METADATA_STORE_BACKEND=$MEMORY_CORE_METADATA_BACKEND" )
+fi
 
 if [[ "$MEMORY_CORE_METADATA_BACKEND" == "mongodb" ]]; then
   # 元数据默认与数据面共用同一 Mongo 实例（不同库：{prefix}_{instance_id}，默认前缀 tdai_metadata）。
@@ -123,9 +138,17 @@ if [[ "$MEMORY_CORE_METADATA_BACKEND" == "mongodb" ]]; then
   TDAI_METADATA_MONGO_URI="${TDAI_METADATA_MONGO_URI:-$MONGODB_ENDPOINT}"
   MONGO_ENV_ARGS+=( -e "TDAI_METADATA_MONGO_URI=$TDAI_METADATA_MONGO_URI" )
   info "memory-core 元数据后端 = mongodb（uri=$TDAI_METADATA_MONGO_URI, 库名 tdai_metadata_<instance>）"
+elif [[ "$MEMORY_CORE_METADATA_BACKEND" == "postgres" ]]; then
+  info "memory-core metadata backend = postgres (schema=${TDAI_METADATA_POSTGRES_SCHEMA:-tdai_metadata})"
 else
   info "memory-core 元数据后端 = sqlite（容器 volume 内）"
 fi
+
+# Personal keys on the /v3 data plane (pw fork): pass through only when set.
+AUTH_ENV_ARGS=()
+for v in TDAI_GATEWAY_SHARED_KEY_MODE TDAI_GATEWAY_PERSONAL_KEYS TDAI_GATEWAY_PERSONAL_KEY_CACHE_MS; do
+  if [[ -n "${!v:-}" ]]; then AUTH_ENV_ARGS+=( -e "$v=${!v}" ); fi
+done
 
 pull_image "$MEMORY_CORE_IMAGE"
 rm_container_if_exists "$CONTAINER"
@@ -223,6 +246,7 @@ $DOCKER run -d --name "$CONTAINER" \
   -e STORE_MODE="$MEMORY_CORE_STORE_MODE" \
   ${MONGO_ENV_ARGS[@]+"${MONGO_ENV_ARGS[@]}"} \
   ${PG_ENV_ARGS[@]+"${PG_ENV_ARGS[@]}"} \
+  ${AUTH_ENV_ARGS[@]+"${AUTH_ENV_ARGS[@]}"} \
   "$MEMORY_CORE_IMAGE" >/dev/null
 
 wait_healthy "$CONTAINER" 90

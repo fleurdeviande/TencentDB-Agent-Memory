@@ -70,7 +70,8 @@ Deviations and unsupported optional methods:
   are absent (`nativeHybridSearch=false`, callers fuse client-side as with sqlite).
 - The store serves profile rows (`profileRows=true`), but `FILE_STORE_MODE=rowfs` is still restricted to
   `db.kind="mongodb"` by `validateResolution`; L2/L3 sync to rows works through the regular profile-sync path.
-- The metadata service (`meta_*`, `MEMORY_CORE_METADATA_BACKEND`) and MemoryKnowledge are unchanged (sqlite).
+- The metadata service (`meta_*`) follows `STORE_MODE=postgres` since `pw/postgres-metadata`, see below;
+  MemoryKnowledge has its own Postgres dialect (`KNOWLEDGE_DB_URL`).
 
 Tests (Node 22, pgvector/pgvector:pg17 with pgvector 0.8.6 from `deploy/pw/docker-compose.dev.yml`; suites
 create and drop their own `tdai_test_*` schema and skip when no database answers at `POSTGRES_TEST_URL`):
@@ -90,10 +91,10 @@ isolation holding across teams.
 
 | package | result |
 |---|---|
-| MemoryCore | vitest 27/27 upstream baseline; 93/93 with the postgres backend and contract runners |
+| MemoryCore | vitest 27/27 upstream baseline; 93/93 with the postgres backend and contract runners; 244/244 with postgres metadata and personal keys |
 | MemoryKnowledge | vitest 161/161 upstream baseline; 173 + 4 skipped on SQLite, 177/177 on Postgres |
 | MemoryCore/claude-code-plugin | tsc clean, vitest 17/17 |
-| pw/mcp | tsc clean, vitest 35/35, smoke OK |
+| pw/mcp | tsc clean, vitest 41/41, smoke OK (incl. a personal-key pass) |
 
 ## pw-mcp: the single MCP server (`pw/mcp/`)
 
@@ -126,11 +127,11 @@ Decisions:
 
 Caveats found on the way:
 
-- **`TDAI_USER_KEY` is not per-person on the data plane yet.** The gateway's `/v3` memory routes check one
-  shared Bearer (`TDAI_GATEWAY_API_KEY`) and take identity from `team_id`/`agent_id`/`user_id` in the body;
-  the per-user `sk-mem-…` keys are only resolved on `/v3/meta/*`. So the "user key" works as the gateway key
-  today, and isolation comes from `TDAI_USER_ID` (default `default` — a warning is logged). MemoryKnowledge's
-  `KNOWLEDGE_SERVICE_KEY` is likewise one service-wide key.
+- ~~`TDAI_USER_KEY` is not per-person on the data plane yet.~~ Fixed in `pw/postgres-metadata`: a personal
+  `sk-mem-…` key is resolved by the gateway and pins the request to its user (see "Personal keys" below);
+  pw-mcp derives user and team from it. With the shared gateway key as `TDAI_USER_KEY` the old behaviour
+  (identity from `TDAI_USER_ID`, default `default`) remains. MemoryKnowledge's `KNOWLEDGE_SERVICE_KEY` is
+  still one service-wide key.
 - The memory SDK's HTTP transport disables TLS verification by default (`rejectUnauthorized: false`).
 - The plugin's `KnowledgeServiceClient` throws `HTTP 404` without the envelope message (`code graph not found`).
 - In knowledge-only mode there is no tool to list wikis or code graphs (`tdai_wiki_list` comes with the memory
@@ -255,3 +256,109 @@ store-level tests). The credential-store and route suites were switched to `crea
   credential rebind that lands between `CodeGraphService.runBuild`'s "credential changed?" check and
   its `ready` write is not re-queued. Same class of race as running several replicas; not addressed.
 - `drizzle.config.ts` still targets SQLite only (drizzle-kit is not used at runtime).
+
+## MemoryCore metadata on PostgreSQL (`pw/postgres-metadata`)
+
+The metadata service (`meta_*`: users, API keys, teams, members, agents, tasks, assets, ACL, config params,
+upstream configs — the panel's and `/v3/meta/*`'s store) gets a third backend next to sqlite and mongodb.
+Code: `MemoryCore/src/metadata/store/postgres-adapter.ts`, `postgres-migrations.ts`, selection in `factory.ts`.
+
+- **Implementation**: a port of `sqlite-adapter.ts` that keeps its SQL: statements are written with `?` and
+  bare `meta_*` names and rewritten to `$n` and schema-qualified names; all values bound, the schema is the
+  only interpolated identifier (validated). Every TEXT column is `COLLATE "C"`, so equality and ORDER BY match
+  SQLite's BINARY collation. Compound writes (user + default key, team + admin member, task + links, fixed-asset
+  replace, asset delete, key revoke with default promotion) run in one transaction; config-param upserts use
+  `ON CONFLICT` on the partial unique indexes instead of select-then-write. Unique violations are recognised by
+  SQLSTATE 23505 + constraint name (`*_pkey` → retry with a new id, `meta_user_keys_key_value_key` →
+  `DuplicateUserKeyError`).
+- **Reuse**: the shared `pg.Pool` per URL, `withTransaction`, `qi`, `assertSchemaName`, `schemaForInstance`
+  and `runMigrations` of `core/store/postgres/` — component `metadata` in `<schema>.schema_migrations`, under
+  the same advisory lock.
+- **Layout**: one schema per instance, like mongo's one database per instance: `default` →
+  `TDAI_METADATA_POSTGRES_SCHEMA` (default `tdai_metadata`), others → `<base>_i_<slug>_<hash>`. Purge
+  (`/v3/instance/destroy`) drops the `meta_*` tables and the metadata migration rows, and the schema only when
+  nothing else is left in it (it may be shared with the memory store if configured so).
+- **Deviations**: none in behaviour the contract checks. `createUserKey` with an explicit duplicate `key_value`
+  throws `DuplicateUserKeyError` (sqlite throws the raw driver error). `close()` does not end the shared pool;
+  `MetadataStorePool.closeAll()` does at shutdown.
+
+Configuration:
+
+| key | default | meaning |
+|---|---|---|
+| `TDAI_METADATA_STORE_BACKEND` | `auto` | `sqlite` / `mongodb` / `postgres` forces the backend. `auto`: Mongo URI set → mongodb (upstream); else `STORE_MODE=postgres` and no explicit `TDAI_METADATA_SQLITE_BASE_DIR` → postgres; else sqlite (upstream). Unknown value → boot fails. |
+| `TDAI_METADATA_POSTGRES_URL` | `POSTGRES_URL` | connection for the metadata store |
+| `TDAI_METADATA_POSTGRES_SCHEMA` | `tdai_metadata` | base schema, validated `[a-z_][a-z0-9_]{0,62}` |
+| `MEMORY_CORE_METADATA_BACKEND` (deploy script) | `auto` | now also `postgres`; `auto` follows `MEMORY_CORE_STORE_MODE=postgres`. Whenever postgres is involved the script passes `TDAI_METADATA_STORE_BACKEND` explicitly, so choosing `sqlite` there stays sqlite. |
+
+`deployMode=service` now accepts postgres as well as mongodb for metadata.
+
+Tests: the upstream contract `metadata-store.contract.ts` had no runner; it now runs against sqlite (58/58,
+`:memory:`) and postgres (58/58, a fresh `tdai_test_*` schema per test, skipped when `POSTGRES_TEST_URL` does
+not answer), plus 10 postgres specifics (backend selection, idempotent concurrent migrations, purge on a shared
+schema, pool: schema per instance and purge). A gateway run with `STORE_MODE=postgres` created the admin, the
+default team and agent through `/v3/internal/meta/user/init-admin` and listed them via `/v3/meta/team/list`,
+rows in `<schema>_meta.meta_*`.
+
+## Personal keys on the /v3 data plane (`pw/postgres-metadata`)
+
+Code: `MemoryCore/src/gateway/personal-key-auth.ts`, gate `applyPersonalKeyGate` in `gateway/server.ts`
+(`V3_ALLOWED_SUBPATHS` exported from `v2-router.ts`). No handler changed.
+
+Rules, applied to `POST` on the 18 `/v3` L0–L3 routes (`conversation/*`, `atomic/*`, `scenario/*`, `core/*`):
+
+| Bearer | result |
+|---|---|
+| `sk-mem-…` that resolves (metadata store of `x-tdai-service-id`) to an **active** user; not the memory system user's key | identity = that user |
+| ↳ `user_id` in body or `x-tdai-user-id` absent | filled with the key's user (body and header) |
+| ↳ `user_id` present and different | **403** — rejected, not overwritten: a misconfigured client fails loudly instead of silently acting under another identity |
+| ↳ `team_id` (body or `x-tdai-team-id`) absent | **422** |
+| ↳ body and header `team_id` differ, or a non-string id | **400** |
+| ↳ team missing, not `active`, or the user's membership not `active` | **403** |
+| `sk-mem-…` that does not resolve (unknown, revoked, expired, inactive user, system key) | **401** |
+| the shared `TDAI_GATEWAY_API_KEY`, or anything else | upstream behaviour (identity from the request) while `TDAI_GATEWAY_SHARED_KEY_MODE=trusted`; **401** on these routes when `off` |
+
+On `/v3/meta/*` a resolving personal Bearer passes layer 1 and doubles as `x-tdai-user-key` (a different
+`x-tdai-user-key` → 401), so a client holding only its personal key can call `auth/verify` and `team/list`.
+Everything else (`/v2/*`, `/v3/skill|knowledge|chat-memory|memory-prompt|…`, `/v3/internal/*`, analytics) is
+unchanged: a personal Bearer there is still a 401 when the shared key is configured. Shared Bearer +
+`x-tdai-user-key` (the panel's pattern — it reads borrowed chat-memory as the asset owner and runs its own ACL)
+stays on the shared-key path. With `TDAI_GATEWAY_API_KEY` unset the gateway is open as upstream; personal keys
+are still pinned, but a caller can simply send none — set the shared key in any real deployment.
+
+| key | default | meaning |
+|---|---|---|
+| `TDAI_GATEWAY_SHARED_KEY_MODE` | `trusted` | `trusted`: the shared key may act as any team/user (upstream); a boot warning says so when the key is set, and the first shared-key request on an L0–L3 route logs once. `off`: L0–L3 requires a personal key; management routes keep the shared key. |
+| `TDAI_GATEWAY_PERSONAL_KEYS` | on | `off` restores upstream exactly (not allowed together with mode `off`) |
+| `TDAI_GATEWAY_PERSONAL_KEY_CACHE_MS` | `30000` | positive key → user and (user, team) → membership lookups are cached this long; a revoked key or removed member keeps working at most this long. `0` disables. |
+
+The deploy script passes the three through when set. Not enforced: `agent_id` (the data plane has no agent
+ownership model) and `session_id`; per-record ownership on `atomic/update|delete` is the handlers' existing
+`iso.userId` check.
+
+pw-mcp: `TDAI_USER_KEY` is the personal key; server and hooks derive the user from `/v3/meta/auth/verify` and
+the team from `/v3/meta/team/list` (exactly one active team → used; several → `TDAI_TEAM_ID` required, memory
+half off otherwise), cached 10 min in `<state dir>/pw-identity.json` (0600, hashed key). `TDAI_USER_ID` is
+only an override for non-personal keys; with a personal key a different value is ignored with a note, because
+the gateway would refuse it. When `auth/verify` does not resolve the key (the shared key, an older gateway) the
+configured identity is kept, as before.
+
+Tests: `personal-key-auth.test.ts` (11: config, pinning rules, resolver on a real sqlite metadata store incl.
+revoked/inactive/system keys and removed memberships) and `personal-key.gateway.test.ts` (7 per backend,
+sqlite and postgres metadata+data plane: own rows only with user_id derived, foreign team 403 on read and
+write, spoofed user_id in body or header 403 with nothing written, unknown key 401, shared key unchanged in
+trusted mode incl. both warnings, `/v3/meta` with the personal Bearer, mode `off`). pw-mcp `identity.test.ts`
+(6) and a personal-key pass in `smoke.sh`.
+
+Results (Node 22, pgvector/pgvector:pg17):
+
+| suite | result |
+|---|---|
+| MemoryCore `npx vitest run` | 20 files, 244/244, exit 0 (93 before + 58 + 58 + 10 metadata + 11 + 14 gateway) |
+| MemoryCore/claude-code-plugin | tsc clean, vitest 17/17, exit 0 |
+| pw/mcp | tsc clean (exit 0), vitest 41/41 (exit 0), `npm run smoke` → SMOKE OK (exit 0) |
+
+Still not on PostgreSQL: MemoryKnowledge's per-wiki `index.db` (FTS5, see above) and code-graph index files;
+the file plane (`FILE_STORE_MODE=local`: L2/L3 markdown, checkpoints, `.metadata/*.json`, the standalone L0
+JSONL mirror) and `LocalStateBackend`'s pipeline state; MemoryProxy's own SQLite (the proxy is not used).
+SQLite stays the default for every store when `STORE_MODE` is not `postgres`.

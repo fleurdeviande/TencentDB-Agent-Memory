@@ -21,7 +21,8 @@ options:
   --purge               uninstall: also delete the config file
 
 config (env, persisted by install): TDAI_URL, KNOWLEDGE_URL, TDAI_USER_KEY
-  optional: KNOWLEDGE_API_TOKEN, TDAI_SERVICE_ID, TDAI_TEAM_ID, TDAI_AGENT_ID, TDAI_USER_ID, PW_MEMORY_CONFIG`;
+  optional: KNOWLEDGE_API_TOKEN, TDAI_SERVICE_ID, TDAI_TEAM_ID, TDAI_AGENT_ID, PW_MEMORY_CONFIG
+  with a personal key (sk-mem-…) the user id comes from the gateway; TDAI_USER_ID only applies to other keys`;
 
 function option(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
