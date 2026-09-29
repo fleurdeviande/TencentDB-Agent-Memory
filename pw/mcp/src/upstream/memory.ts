@@ -4,6 +4,7 @@ export {
   createKnowledge,
   createMemoryClient,
   handleHook,
+  KnowledgeServiceClient,
   loadConfig as loadPluginConfig,
   MEMORY_TOOLS_GUIDE,
   PluginState,

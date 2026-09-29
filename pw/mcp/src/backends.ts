@@ -6,8 +6,11 @@ import { createMemoryBackend } from "./memory-backend.js";
 import type { BackendFactory } from "./server.js";
 import { loadPluginConfig } from "./upstream/memory.js";
 
-export const knowledgeFactory: BackendFactory = async (config: PwConfig) =>
-  config.knowledge ? createKnowledgeBackend({ url: config.knowledge.url, token: config.knowledge.token }) : undefined;
+export const knowledgeFactory: BackendFactory = async (config: PwConfig) => {
+  if (!config.knowledge) return undefined;
+  const { serviceId, teamId, userId, agentId } = loadPluginConfig(config.pluginEnv);
+  return createKnowledgeBackend({ url: config.knowledge.url, token: config.knowledge.token, identity: { serviceId, teamId, userId, agentId } });
+};
 
 export const memoryFactory: BackendFactory = async (config: PwConfig) => {
   if (!config.memory) return undefined;

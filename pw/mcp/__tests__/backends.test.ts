@@ -82,7 +82,7 @@ describe("round trips over HTTP", () => {
       "/v3/code-graph/status": { text: "cg-1: ready, 420 files", isError: false },
       "/v3/wiki/page/ls": { pages: [{ ref: "arch", title: "Architecture" }] },
     });
-    const { client, close } = await open({ KNOWLEDGE_URL: knowledge.url, TDAI_USER_KEY: "sk-mem-test" });
+    const { client, close } = await open({ KNOWLEDGE_URL: knowledge.url, TDAI_USER_KEY: "sk-mem-test", TDAI_SERVICE_ID: "svc1", TDAI_TEAM_ID: "t1" });
     try {
       const status = await client.callTool({ name: "code_status", arguments: { code_graph_id: "cg-1" } });
       expect(status).toMatchObject({ isError: false, content: [{ text: "cg-1: ready, 420 files" }] });
@@ -90,9 +90,10 @@ describe("round trips over HTTP", () => {
       expect(JSON.parse(text(pages))).toEqual({ pages: [{ ref: "arch", title: "Architecture" }] });
       const missing = await client.callTool({ name: "code_impact", arguments: { code_graph_id: "cg-1", symbol: "x" } });
       expect(missing.isError).toBe(true);
-      expect(text(missing)).toContain("no route /v3/code-graph/impact");
-      expect(knowledge.requests[0]).toMatchObject({ path: "/v3/code-graph/status", body: { code_graph_id: "cg-1" } });
-      expect(knowledge.requests[0].headers.authorization).toBe("Bearer sk-mem-test");
+      expect(text(missing)).toContain("/v3/code-graph/impact returned HTTP 404");
+      // The multi-tenant service rejects requests without the service-id header and team_id (400).
+      expect(knowledge.requests[0]).toMatchObject({ path: "/v3/code-graph/status", body: { code_graph_id: "cg-1", team_id: "t1" } });
+      expect(knowledge.requests[0].headers).toMatchObject({ authorization: "Bearer sk-mem-test", "x-tdai-service-id": "svc1" });
     } finally {
       await close();
       await knowledge.close();

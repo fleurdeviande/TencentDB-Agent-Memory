@@ -1,28 +1,24 @@
 /**
- * Knowledge half: MemoryKnowledge's 12 tool definitions and its `callApi` HTTP client, imported from
- * source. The result mapping below mirrors MemoryKnowledge/src/mcp/server.ts, which cannot be imported
- * (see upstream/knowledge.ts).
+ * Knowledge half: MemoryKnowledge's 12 tool definitions, sent over the #1268 plugin's
+ * KnowledgeServiceClient (Bearer, `x-tdai-service-id`, team/user/agent in the body, envelope unwrap,
+ * timeout). MemoryKnowledge's own callApi cannot be used, see upstream/knowledge.ts. The result mapping
+ * mirrors MemoryKnowledge/src/mcp/server.ts.
  */
 
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { errorResult, type ToolBackend } from "./registry.js";
-import { callApi, MCP_TOOLS, type McpToolDef } from "./upstream/knowledge.js";
+import { MCP_TOOLS, type McpToolDef } from "./upstream/knowledge.js";
+import { KnowledgeServiceClient, type PluginConfig } from "./upstream/memory.js";
+
+export const KNOWLEDGE_TOOL_NAMES: readonly string[] = MCP_TOOLS.map((tool) => tool.name);
 
 export interface KnowledgeBackendOptions {
   url: string;
   token?: string;
-  /** `callApi` has no timeout of its own; a hung service must not hang the tool call. */
+  /** Tenant identity, shared with the memory half. */
+  identity: Pick<PluginConfig, "serviceId" | "teamId" | "userId" | "agentId">;
   timeoutMs?: number;
-}
-
-export const KNOWLEDGE_TOOL_NAMES: readonly string[] = MCP_TOOLS.map((tool) => tool.name);
-
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms} ms`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  fetch?: typeof globalThis.fetch;
 }
 
 export function toCallToolResult(data: unknown): CallToolResult {
@@ -38,8 +34,13 @@ export function createKnowledgeBackend(options: KnowledgeBackendOptions): ToolBa
   const byName = new Map<string, McpToolDef>(MCP_TOOLS.map((tool) => [tool.name, tool]));
   // Upstream types properties as Record<string, unknown>; every value is a JSON Schema object.
   const tools = MCP_TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) as Tool[];
-  const timeoutMs = options.timeoutMs ?? 30_000;
-  const http = { baseUrl: options.url, token: options.token };
+  const client = new KnowledgeServiceClient({
+    baseUrl: options.url,
+    apiKey: options.token,
+    ...options.identity,
+    timeoutMs: options.timeoutMs ?? 30_000,
+    fetch: options.fetch,
+  });
 
   return {
     name: "knowledge",
@@ -48,13 +49,14 @@ export function createKnowledgeBackend(options: KnowledgeBackendOptions): ToolBa
       const tool = byName.get(name);
       if (!tool) return errorResult(`Unknown tool: ${name}`);
       try {
-        return toCallToolResult(await withTimeout(callApi(http, tool.endpoint, args), timeoutMs, name));
+        return toCallToolResult(await client.post(`/v3${tool.endpoint}`, args));
       } catch (error) {
         return errorResult(`Error: ${error instanceof Error ? error.message : String(error)}`);
       }
     },
     instructions: () =>
-      "Knowledge tools: code_* query the indexed code graphs (ids cg-...), wiki_* the team wikis (ids wiki-...). " +
-      "Use them before searching the filesystem for architecture, contracts and cross-repo call chains.",
+      "Knowledge tools: code_* query the indexed code graphs (ids cg-...), wiki_* the team wikis (ids wiki-..., " +
+      "listed by tdai_wiki_list when memory is enabled). Use them before searching the filesystem for architecture, " +
+      "contracts and cross-repo call chains.",
   };
 }
