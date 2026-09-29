@@ -150,7 +150,7 @@ function collectV3Missing(
 }
 
 /** /v3 强 isolation 覆盖的 L0–L3 子路径（去掉前缀后的 path）。 */
-const V3_ALLOWED_SUBPATHS = new Set<string>([
+export const V3_ALLOWED_SUBPATHS = new Set<string>([
   "/conversation/add",
   "/conversation/query",
   "/conversation/search",

@@ -60,7 +60,16 @@ import { StorePool } from "../core/store/store-pool.js";
 import { validateAndNormalizeRaw, SeedValidationError } from "../core/seed/input.js";
 import { executeSeed } from "../core/seed/seed-runtime.js";
 import type { SeedProgress } from "../core/seed/types.js";
-import { handleV2Route, errorEnvelope, makeRequestId } from "./v2-router.js";
+import { handleV2Route, errorEnvelope, makeRequestId, V3_ALLOWED_SUBPATHS } from "./v2-router.js";
+import {
+  bearerToken,
+  enforcePersonalIdentity,
+  looksLikePersonalKey,
+  PersonalKeyResolver,
+  readPersonalKeyConfig,
+  type PersonalKeyConfig,
+} from "./personal-key-auth.js";
+import { normalizeInstanceIdForRoute } from "../metadata/router/instance.js";
 import type { V2RouterDeps } from "./v2-router.js";
 import { handleV3MetaRoute, V3_PREFIX } from "../metadata/router/v3-meta-router.js";
 import { handleInternalMetaRoute, V3_INTERNAL_PREFIX } from "../metadata/router/internal-meta-router.js";
@@ -327,6 +336,14 @@ export class TdaiGateway {
   private analyticsChInitPromise: Promise<void> | null = null;
   private memorySystemUserConfig: MemorySystemUserConfig | undefined;
   private readonly metadataServiceByInstance = new Map<string, MetadataService>();
+
+  // ── Personal keys on the /v3 data plane (pw fork, see personal-key-auth.ts) ──
+  private readonly personalKeys: PersonalKeyConfig = readPersonalKeyConfig();
+  private readonly personalKeyResolver = new PersonalKeyResolver(
+    (instanceId) => this.ensureMetadataService(instanceId),
+    this.personalKeys.cacheTtlMs,
+  );
+  private sharedKeyDataPlaneWarned = false;
 
   // ── Skill conversation-add (§21): per-instance handler cache ──
   //
@@ -801,6 +818,18 @@ export class TdaiGateway {
         "TDAI_GATEWAY_API_KEY, before continuing."
       );
     }
+    if (this.personalKeys.sharedKeyMode === "trusted" && authOn) {
+      this.logger.warn(
+        "Shared gateway key is trusted on the /v3 memory data plane: a request authenticated with " +
+        "TDAI_GATEWAY_API_KEY may act as any team_id/user_id it names. Give users personal keys " +
+        "(sk-mem-…, identity enforced server-side) and set TDAI_GATEWAY_SHARED_KEY_MODE=off once " +
+        "no user traffic uses the shared key.",
+      );
+    }
+    this.logger.info(
+      `Personal keys on /v3 L0-L3 + /v3/meta: ${this.personalKeys.enabled ? "enabled" : "disabled"}, ` +
+      `shared key mode=${this.personalKeys.sharedKeyMode}`,
+    );
     if (corsOrigins.includes("*")) {
       this.logger.warn(
         "CORS allow-list contains '*' — every browser origin can call this " +
@@ -924,6 +953,9 @@ export class TdaiGateway {
         return await this.handleInstanceDestroyV3(req, res);
       }
 
+      const personal = await this.applyPersonalKeyGate(req, res, pathname, method);
+      if (personal.handled) return;
+
       // ── v3 internal metadata（/v3/internal/meta/*，仅 Bearer）──
       if (pathname.startsWith(`${V3_INTERNAL_PREFIX}/`)) {
         if (!this.checkAuthForV2(req, res)) return;
@@ -940,7 +972,7 @@ export class TdaiGateway {
       // ── v3 metadata routes (/v3/meta/*) ──
       // Layer 1: same Bearer apiKey gate as v2. Layer 3 (x-tdai-user-key) in handleV3MetaRoute.
       if (pathname.startsWith(`${V3_PREFIX}/`)) {
-        if (!this.checkAuthForV2(req, res)) return;
+        if (personal.kind !== "meta" && !this.checkAuthForV2(req, res)) return;
         const handledV3 = await handleV3MetaRoute(req, res, pathname, method, parseJsonBody, sendJson, {
           getMetadataService: (instanceId) => this.ensureMetadataService(instanceId),
           logger: this.logger,
@@ -982,7 +1014,7 @@ export class TdaiGateway {
       // is a no-op (default-open), matching the develop_server_test
       // baseline.
       if (pathname.startsWith("/v2/") || pathname.startsWith("/v3/")) {
-        if (!this.checkAuthForV2(req, res)) return;
+        if (personal.kind !== "data" && !this.checkAuthForV2(req, res)) return;
       }
 
       const v2Deps: V2RouterDeps = {
@@ -1117,7 +1149,8 @@ export class TdaiGateway {
         res,
         pathname,
         method,
-        parseJsonBody,
+        // Personal-key requests arrive with the body already parsed and pinned to the key's identity.
+        personal.kind === "data" ? async <T,>() => personal.body as T : parseJsonBody,
         sendJson,
         mergedDeps as V2RouterDeps,
         extraRoutes,
@@ -1220,6 +1253,78 @@ export class TdaiGateway {
       return "invalid";
     }
     return "ok";
+  }
+
+  /**
+   * Personal-key gate for /v3 L0–L3 (POST) and /v3/meta/* (see personal-key-auth.ts).
+   *
+   *   - kind "data": Bearer is a valid personal key; `body` is parsed and pinned to its identity.
+   *   - kind "meta": Bearer is a valid personal key; it doubles as x-tdai-user-key.
+   *   - kind "none": not a personal-key request; upstream auth applies unchanged, except that
+   *     TDAI_GATEWAY_SHARED_KEY_MODE=off rejects it on the L0–L3 routes.
+   */
+  private async applyPersonalKeyGate(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    pathname: string,
+    method: string,
+  ): Promise<
+    | { handled: true }
+    | { handled: false; kind: "none" | "meta" }
+    | { handled: false; kind: "data"; body: Record<string, unknown> }
+  > {
+    const none = { handled: false as const, kind: "none" as const };
+    const isData = method === "POST" && pathname.startsWith("/v3/") && V3_ALLOWED_SUBPATHS.has(pathname.slice(3));
+    const isMeta = pathname.startsWith(`${V3_PREFIX}/`);
+    if (!this.personalKeys.enabled || (!isData && !isMeta)) return none;
+
+    const deny = (status: number, message: string) => {
+      sendJson(res, status, errorEnvelope(status, message, makeRequestId()));
+      return { handled: true as const };
+    };
+    const token = bearerToken(req.headers["authorization"]);
+    const sharedKey = this.config.server.apiKey;
+    const isShared = !!sharedKey && !!token && safeEqual(token, sharedKey);
+
+    if (!looksLikePersonalKey(token) || isShared) {
+      if (!isData) return none;
+      if (this.personalKeys.sharedKeyMode === "off") {
+        return deny(401, "a personal key (Authorization: Bearer sk-mem-…) is required on this route");
+      }
+      if (isShared && !this.sharedKeyDataPlaneWarned) {
+        this.sharedKeyDataPlaneWarned = true;
+        this.logger.warn(
+          `[auth] shared gateway key used on ${pathname}: team_id/user_id are taken from the request ` +
+          "(logged once per process)",
+        );
+      }
+      return none;
+    }
+
+    let instanceId: string;
+    try {
+      instanceId = normalizeInstanceIdForRoute(String(req.headers["x-tdai-service-id"] ?? ""));
+    } catch {
+      return deny(401, "Missing or invalid x-tdai-service-id header");
+    }
+    const identity = await this.personalKeyResolver.resolve(instanceId, token);
+    if (!identity) return deny(401, "Unauthorized: invalid personal key");
+
+    if (isMeta) {
+      const headerKey = String(req.headers["x-tdai-user-key"] ?? "").trim();
+      if (headerKey && headerKey !== token) return deny(401, "x-tdai-user-key does not match the Bearer personal key");
+      req.headers["x-tdai-user-key"] = token;
+      return { handled: false, kind: "meta" };
+    }
+
+    const verdict = await enforcePersonalIdentity(
+      await parseJsonBody(req),
+      req.headers as Record<string, string | string[] | undefined>,
+      identity,
+      (teamId) => this.personalKeyResolver.isActiveMember(identity, teamId),
+    );
+    if (!verdict.ok) return deny(verdict.status, verdict.message);
+    return { handled: false, kind: "data", body: verdict.body };
   }
 
   /**

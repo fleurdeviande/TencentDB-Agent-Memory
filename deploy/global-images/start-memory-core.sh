@@ -144,6 +144,12 @@ else
   info "memory-core 元数据后端 = sqlite（容器 volume 内）"
 fi
 
+# Personal keys on the /v3 data plane (pw fork): pass through only when set.
+AUTH_ENV_ARGS=()
+for v in TDAI_GATEWAY_SHARED_KEY_MODE TDAI_GATEWAY_PERSONAL_KEYS TDAI_GATEWAY_PERSONAL_KEY_CACHE_MS; do
+  if [[ -n "${!v:-}" ]]; then AUTH_ENV_ARGS+=( -e "$v=${!v}" ); fi
+done
+
 pull_image "$MEMORY_CORE_IMAGE"
 rm_container_if_exists "$CONTAINER"
 
@@ -240,6 +246,7 @@ $DOCKER run -d --name "$CONTAINER" \
   -e STORE_MODE="$MEMORY_CORE_STORE_MODE" \
   ${MONGO_ENV_ARGS[@]+"${MONGO_ENV_ARGS[@]}"} \
   ${PG_ENV_ARGS[@]+"${PG_ENV_ARGS[@]}"} \
+  ${AUTH_ENV_ARGS[@]+"${AUTH_ENV_ARGS[@]}"} \
   "$MEMORY_CORE_IMAGE" >/dev/null
 
 wait_healthy "$CONTAINER" 90
