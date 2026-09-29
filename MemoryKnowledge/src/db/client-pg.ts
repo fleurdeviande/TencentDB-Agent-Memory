@@ -57,6 +57,7 @@ export async function openPostgresDb(opts: OpenPostgresOptions): Promise<Knowled
     // Same builder surface as the SQLite db for everything the stores use; see KnowledgeDb.
     orm: orm as unknown as Db,
     tables,
+    pgPool: pool,
     close: () => pool.end(),
   };
 }

@@ -142,6 +142,47 @@ const DDL = `
   );
   CREATE INDEX IF NOT EXISTS idx_kgca_cred
     ON knowledge_git_credential_audit(credential_id, id DESC);
+
+  -- Per-wiki search index (the SQLite side keeps one index.db per wiki; see engines/wiki/index-store-pg.ts).
+  -- page_meta + wiki_fts in one row: title_tok/content_tok hold the same pre-tokenised text SQLite feeds
+  -- FTS5; the generated tsvector weights the title A and the content D (ts_rank_cd weights 1.0 / 0.2 = 5:1).
+  CREATE TABLE IF NOT EXISTS knowledge_wiki_page (
+    wiki_id     TEXT NOT NULL,
+    page_id     TEXT NOT NULL,
+    title       TEXT,
+    type        TEXT,
+    rel_path    TEXT,
+    snippet     TEXT,
+    title_tok   TEXT NOT NULL DEFAULT '',
+    content_tok TEXT NOT NULL DEFAULT '',
+    fts         TSVECTOR GENERATED ALWAYS AS (
+                  setweight(to_tsvector('simple'::regconfig, title_tok), 'A') ||
+                  setweight(to_tsvector('simple'::regconfig, content_tok), 'D')
+                ) STORED,
+    PRIMARY KEY (wiki_id, page_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_kwp_fts ON knowledge_wiki_page USING GIN (fts);
+
+  CREATE TABLE IF NOT EXISTS knowledge_wiki_edge (
+    wiki_id   TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    PRIMARY KEY (wiki_id, source_id, target_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS knowledge_wiki_source (
+    wiki_id          TEXT NOT NULL,
+    filename         TEXT NOT NULL,
+    sha256           TEXT NOT NULL,
+    size             INTEGER NOT NULL,
+    status           TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    last_modified_by TEXT,
+    ingested_at      TEXT,
+    ingest_error     TEXT,
+    PRIMARY KEY (wiki_id, filename)
+  );
 `;
 
 /** Validated identifier: the schema name is interpolated into DDL, so no quoting games. */

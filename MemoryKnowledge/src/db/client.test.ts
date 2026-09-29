@@ -66,6 +66,9 @@ describe.runIf(TEST_DIALECT === "postgres")("Postgres migrations", () => {
         "knowledge_git_credential_audit",
         "knowledge_wiki",
         "knowledge_wiki_audit",
+        "knowledge_wiki_edge",
+        "knowledge_wiki_page",
+        "knowledge_wiki_source",
         "llm_binding",
       ]);
     } finally {
