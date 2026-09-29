@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { createDb, type Db } from "../db/client.js";
+import { createTestDb, type TestDb } from "../test-utils/db.js";
 import { SecretKeyError } from "../crypto/secret-box.js";
 import { genGitCredentialId } from "./ids.js";
 import { DuplicateCredentialNameError, createGitCredentialStore, type IGitCredentialStore } from "./git-credential-store.js";
@@ -16,12 +16,16 @@ const SERVICE = "svc-A";
 const TEAM = "team-1";
 const TOKEN = "ghp_TESTTOKEN1234567890";
 
-let db: Db;
+let db: TestDb;
 let store: IGitCredentialStore;
 
-beforeEach(() => {
-  ({ db } = createDb({ path: ":memory:" }));
+beforeEach(async () => {
+  db = await createTestDb();
   store = createGitCredentialStore({ db, secretKey: SECRET_KEY });
+});
+
+afterEach(async () => {
+  await db.dispose();
 });
 
 function createToken(overrides: Partial<Parameters<IGitCredentialStore["create"]>[0]> = {}) {

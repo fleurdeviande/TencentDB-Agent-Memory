@@ -10,9 +10,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Hono } from "hono";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createDb } from "../db/client.js";
+import { createTestDb, type TestDb } from "../test-utils/db.js";
 import {
   CodeGraphService,
   SqliteKnowledgeStore,
@@ -37,8 +37,9 @@ let workerGate: Promise<void> | null;
 /** 可选：按调用次序决定成败（true = 抛错）。 */
 let workerFailOnCall: ((callIndex: number, credentialId: string | null) => boolean) | null;
 
+let db: TestDb;
+
 function buildApp() {
-  const { db } = createDb({ path: ":memory:" });
   const store = new SqliteKnowledgeStore(db);
   credentialStore = createGitCredentialStore({ db, secretKey: SECRET_KEY });
   workerCalls = [];
@@ -103,8 +104,15 @@ function seedCredential(host = "git.example.com") {
   });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  db = await createTestDb();
   app = buildApp();
+});
+
+afterEach(async () => {
+  // Let background builds finish before the DB goes away (a gated worker is released by its test).
+  await cgService.onIdle();
+  await db.dispose();
 });
 
 describe("POST /code-graph/create + credential_id", () => {
