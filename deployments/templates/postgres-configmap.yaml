@@ -1,0 +1,11 @@
+{{- if .Values.postgres.enabled }}
+# docker-entrypoint-initdb.d: runs only on an empty data directory (first boot of the PVC).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "agent-memory.postgres.name" . }}-init
+  labels:
+    {{- include "agent-memory.postgres.labels" . | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/postgres-init/*.sql").AsConfig | nindent 2 }}
+{{- end }}

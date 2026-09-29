@@ -1,0 +1,28 @@
+---
+# agent-memory deploy = ArgoCD through gitlab-ci-commons /main-argo.yml (same path as litellm-gateway):
+#   build (root Dockerfile -> ${CI_REGISTRY_IMAGE}:${IMAGE_TAG}) -> helm package deployments -> a bridge
+#   into Pushwoosh/deployments-state, which bumps bootstrap/clusters/nue/devops/agent-memory.yaml,
+#   waits for the rollout and reverts its own commit if it does not converge.
+# Release = SemVer tag `vX.Y.Z`; the promote is the manual gate. See DEPLOY.md.
+#
+# Required CI/CD variable (Settings -> CI/CD -> Variables):
+#   K8S_NAMESPACE  - target namespace (file default below = devops; a UI variable overrides it)
+include:
+  - project: "platform/tools/gitlab-ci-commons"
+    file: "/main-argo.yml"
+
+variables:
+  K8S_NAMESPACE: devops
+
+# No monitoring/ chart in this repo; keep the stage off like litellm-gateway.
+Deploy Monitoring | NUE:
+  rules:
+    - when: never
+
+Deploy Monitoring | OVB:
+  rules:
+    - when: never
+
+Deploy Monitoring | IAD:
+  rules:
+    - when: never
