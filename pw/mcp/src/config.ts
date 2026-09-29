@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isPersonalKey } from "./identity.js";
 import { describeUrl } from "./log.js";
 
 /** Keys read from env and persisted by `install`. Everything else in env passes through untouched. */
@@ -120,7 +121,10 @@ export function loadPwConfig(env: NodeJS.ProcessEnv = process.env, options: Load
   if (!knowledgeUrl) notes.push("knowledge tools (code_*, wiki_*) disabled: KNOWLEDGE_URL is unset");
   else notes.push(`knowledge tools enabled: ${describeUrl(knowledgeUrl)}`);
   if ((memoryUrl || knowledgeUrl) && !userKey) notes.push("TDAI_USER_KEY is unset: requests carry no credential");
-  if (memoryUrl && !values.TDAI_USER_ID) notes.push("TDAI_USER_ID is unset: memory is read and written as user \"default\"");
+  // With a personal key the user id is derived from the gateway (identity.ts), which adds its own note.
+  if (memoryUrl && !values.TDAI_USER_ID && !isPersonalKey(userKey)) {
+    notes.push("TDAI_USER_ID is unset: memory is read and written as user \"default\"");
+  }
 
   // The plugin reads its own variable names; map ours onto them and drop stale plugin-only settings.
   const pluginEnv: NodeJS.ProcessEnv = { ...env };

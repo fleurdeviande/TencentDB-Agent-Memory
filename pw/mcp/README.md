@@ -15,7 +15,7 @@ Node 22 is required, like everywhere else in this repo.
 
 ```bash
 cd TencentDB-Agent-Memory/pw/mcp && npx -y pnpm@9 install --ignore-workspace && npm run build
-export TDAI_URL=https://memory.example.corp KNOWLEDGE_URL=https://knowledge.example.corp TDAI_USER_KEY=sk-mem-... TDAI_USER_ID=$USER
+export TDAI_URL=https://memory.example.corp KNOWLEDGE_URL=https://knowledge.example.corp TDAI_USER_KEY=sk-mem-...
 node dist/cli.js install          # add --dry-run first if you like to look before you leap
 ```
 
@@ -47,11 +47,16 @@ Environment wins over the config file, key by key, so a shell (or direnv) can ov
 |---|---|---|
 | `TDAI_URL` | for memory | MemoryCore gateway. Unset → memory tools and hooks are off |
 | `KNOWLEDGE_URL` | for knowledge | MemoryKnowledge. Unset → `code_*` / `wiki_*` are off |
-| `TDAI_USER_KEY` | yes, in practice | Bearer for the gateway; also for MemoryKnowledge unless `KNOWLEDGE_API_TOKEN` is set |
+| `TDAI_USER_KEY` | yes, in practice | your personal key (`sk-mem-…`, from the panel or `/v3/meta/user-key/create`): Bearer for the gateway, which resolves it to you; also for MemoryKnowledge unless `KNOWLEDGE_API_TOKEN` is set |
 | `KNOWLEDGE_API_TOKEN` | no | MemoryKnowledge service key, when it differs from the user key |
-| `TDAI_USER_ID` | recommended | your user id in the isolation triple; unset means `default` (shared with everyone else who left it unset) |
-| `TDAI_TEAM_ID` / `TDAI_AGENT_ID` / `TDAI_SERVICE_ID` | no | rest of the isolation triple and the instance id, default `default` |
+| `TDAI_TEAM_ID` | when you are in several teams | the team to read and write; with a personal key and exactly one team it is picked for you, with several and none set the memory half stays off (stderr says which teams) |
+| `TDAI_AGENT_ID` / `TDAI_SERVICE_ID` | no | agent of the isolation triple and the instance id, default `default` |
+| `TDAI_USER_ID` | no | only for a non-personal key (the shared gateway key): the user id to act as, default `default`. With a personal key the gateway pins requests to the key's user, so the id is asked from it (`/v3/meta/auth/verify`) and a different `TDAI_USER_ID` is ignored with a note |
 | `PW_MEMORY_CONFIG` | no | alternative config file path |
+
+The derived user and team are cached for 10 minutes in `<state dir>/pw-identity.json` (0600, keyed by a hash,
+the key itself is not stored), so hooks do not ask the gateway every time. A gateway without personal-key
+support leaves `TDAI_USER_ID` / `default` in place, as before.
 
 The #1268 tuning knobs (`TDAI_RECALL_MAX_RESULTS`, `TDAI_CAPTURE`, `TDAI_STOP_BUDGET_MS`, …) pass through
 unchanged; see `MemoryCore/claude-code-plugin/README.md`.

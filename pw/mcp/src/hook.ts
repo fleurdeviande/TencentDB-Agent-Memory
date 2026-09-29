@@ -10,6 +10,7 @@
 
 import type { PwConfig } from "./config.js";
 import { loadPwConfig } from "./config.js";
+import { applyKeyIdentity, type IdentityOptions } from "./identity.js";
 import type { Log } from "./log.js";
 import {
   createMemoryClient,
@@ -43,12 +44,13 @@ export interface HookRunOptions {
   log: Log;
   /** Tests point this at a temp dir; Claude Code's own default otherwise. */
   claudeConfigDir?: string;
+  identity?: IdentityOptions;
 }
 
 /** Returns the JSON line for stdout. Fails open with `{}` on every error. */
 export async function runHook(stdin: string, options: HookRunOptions): Promise<string> {
   try {
-    const config = loadPwConfig(options.env ?? process.env);
+    const config = await applyKeyIdentity(loadPwConfig(options.env ?? process.env), options.identity);
     if (!config.memory) return "{}";
     const input = JSON.parse(stdin) as HookInput;
     const pluginConfig = loadPluginConfig(config.pluginEnv);
