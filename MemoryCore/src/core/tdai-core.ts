@@ -65,6 +65,9 @@ import {
   resolveSkillConfig,
   SKILL_REVIEW_PROMPT,
 } from "./skill/index.js";
+import type { ISkillStore } from "./skill/skill-store.interface.js";
+import { PostgresMemoryStore } from "./store/postgres/memory-store.js";
+import { PostgresSkillStore } from "./store/postgres/skill-store.js";
 // Skill async-extract 现在完全走 conversation-add 侧的 agent 队列 + Worker
 // (SkillTriggerService.archive → agent 队列 → SkillConversationExtractWorker),
 // 由 gateway/openclaw host wiring 的 wireConversationAdd 起。tdai-core 只负责
@@ -866,23 +869,29 @@ export class TdaiCore {
         getRawDb?: () => unknown;
         getEmbeddingDimensions?: () => number;
       };
-      if (typeof rawDbCarrier.getRawDb !== "function") {
+      // Postgres: skill rows live in the memory store's schema, on its pool.
+      const pgStore = this.vectorStore instanceof PostgresMemoryStore ? this.vectorStore : undefined;
+      if (!pgStore && typeof rawDbCarrier.getRawDb !== "function") {
         this.logger.warn(
           `${TAG} Skill wiring skipped: vectorStore does not expose getRawDb() (only SQLite-backed VectorStore is supported in MVP)`,
         );
         return;
       }
-      const db = rawDbCarrier.getRawDb() as import("node:sqlite").DatabaseSync;
-      const dimensions =
-        typeof rawDbCarrier.getEmbeddingDimensions === "function"
-          ? rawDbCarrier.getEmbeddingDimensions()
-          : (this.cfg.embedding.dimensions ?? 0);
-
-      const skillStore = new SqliteSkillStore({
-        db,
-        dimensions,
-        logger: this.logger,
-      });
+      let skillStore: ISkillStore;
+      if (pgStore) {
+        skillStore = new PostgresSkillStore({ pool: pgStore.getPool(), schema: pgStore.getSchema(), logger: this.logger });
+      } else {
+        const db = rawDbCarrier.getRawDb!() as import("node:sqlite").DatabaseSync;
+        const dimensions =
+          typeof rawDbCarrier.getEmbeddingDimensions === "function"
+            ? rawDbCarrier.getEmbeddingDimensions()
+            : (this.cfg.embedding.dimensions ?? 0);
+        skillStore = new SqliteSkillStore({
+          db,
+          dimensions,
+          logger: this.logger,
+        });
+      }
       skillStore.init();
 
       const skillResources = new SkillResourceStore({

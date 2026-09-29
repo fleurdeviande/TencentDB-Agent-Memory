@@ -105,6 +105,23 @@ export function readMongoEnvConfig(): MongoEnvConfig {
   };
 }
 
+/** PostgreSQL backend connection (STORE_MODE=postgres). */
+export interface PostgresEnvConfig {
+  url: string;
+  schema: string;
+}
+
+/**
+ * Read POSTGRES_URL / POSTGRES_SCHEMA. Empty strings mean "unset" so callers
+ * can fall back to the `memory.postgres` config block.
+ */
+export function readPostgresEnvConfig(): PostgresEnvConfig {
+  return {
+    url: ENV.POSTGRES_URL ?? "",
+    schema: ENV.POSTGRES_SCHEMA ?? "",
+  };
+}
+
 /**
  * Optional COS credentials. Returns `null` if `COS_SECRET_ID` is unset
  * (the marker we use to mean "COS not configured for this deployment").

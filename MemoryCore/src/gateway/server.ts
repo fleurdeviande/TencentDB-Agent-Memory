@@ -89,6 +89,7 @@ import {
 } from "../api-trace/index.js";
 import { readApiTraceEnabled } from "../utils/env-config.js";
 import { readMongoEnvConfig } from "../utils/env-config.js";
+import { describePostgresUrl, resolvePostgresStoreConfig } from "../core/store/postgres/config.js";
 import { makeSkillRouteTable } from "./skill-handlers.js";
 import { handleV3AnalyticsRoute, createAnalyticsChClientAsync } from "./analytics/index.js";
 import type { AnalyticsChClient } from "./analytics/index.js";
@@ -1058,7 +1059,7 @@ export class TdaiGateway {
         // 复用 Memory 侧的 COS adapter，创建 per-instance SkillCore。
         // Skill queue + worker 如果已在 tdai-core 中启动则复用；否则
         // service 模式下可在此处单独启动。
-        if (storePool.mode === "tcvdb" || storePool.mode === "mongodb") {
+        if (storePool.mode === "tcvdb" || storePool.mode === "mongodb" || storePool.mode === "postgres") {
           // per-instance resolvers 抽到了私有方法（同一份实现被 handler 和 skill worker 共用）。
           // tcvdb: TcvdbSkillStore + COS storage；mongodb: MongoSkillStore + (standalone) LocalStorage / (service) COS。
           skillDeps.resolveSkillCore = (instanceId: string) => this.resolveSkillCoreForInstance(instanceId);
@@ -1074,7 +1075,7 @@ export class TdaiGateway {
         //   - handleConversationAdd 用 .handler
         //   - handleExtract 用 .trigger (direct-trigger)
         skillDeps.resolveConversationAdd = async (instanceId: string) => {
-          const wired = storePool.mode === "tcvdb" || storePool.mode === "mongodb"
+          const wired = storePool.mode === "tcvdb" || storePool.mode === "mongodb" || storePool.mode === "postgres"
             ? await this.ensureConversationAddForInstance(instanceId)
             : await this.ensureConversationAddForStandalone(instanceId);
           return wired;
@@ -1957,7 +1958,8 @@ export class TdaiGateway {
     // pieces local while exercising the rest of the service-mode wiring.
     const storeModeOverride =
       process.env.STORE_MODE === "sqlite" || process.env.STORE_MODE === "tcvdb" || process.env.STORE_MODE === "mongodb"
-        ? (process.env.STORE_MODE as "sqlite" | "tcvdb" | "mongodb")
+        || process.env.STORE_MODE === "postgres"
+        ? (process.env.STORE_MODE as "sqlite" | "tcvdb" | "mongodb" | "postgres")
         : undefined;
     const effectiveStoreMode = storeModeOverride ?? (this.config.deployMode === "service" ? "tcvdb" : "sqlite");
     // T12 fail-fast: mongodb backend hard-requires MONGODB_ENDPOINT/DATABASE
@@ -1975,6 +1977,13 @@ export class TdaiGateway {
         );
       }
       this.logger.info(`[gateway] Store backend = mongodb (endpoint=${mongoEnv.endpoint}, database=${mongoEnv.database})`);
+    }
+    if (effectiveStoreMode === "postgres") {
+      const pg = resolvePostgresStoreConfig(this.config.memory.postgres);
+      if (!pg.url) {
+        throw new Error("[gateway] STORE_MODE=postgres requires POSTGRES_URL (or memory.postgres.url) to be set");
+      }
+      this.logger.info(`[gateway] Store backend = postgres (endpoint=${describePostgresUrl(pg.url)}, schema=${pg.schema})`);
     }
     this.storePool = new StorePool({
       mode: effectiveStoreMode,
@@ -2441,7 +2450,7 @@ export class TdaiGateway {
     //     MongoSkillStore). This holds even for standalone + STORE_MODE=mongodb.
     //   - otherwise (sqlite singleton) → TdaiCore's standalone SkillExtractor.
     const usePerInstanceSkill =
-      this.storePool?.mode === "tcvdb" || this.storePool?.mode === "mongodb";
+      this.storePool?.mode === "tcvdb" || this.storePool?.mode === "mongodb" || this.storePool?.mode === "postgres";
 
     this.skillWorkerPool = new SkillWorkerPool({
       concurrency: skillCfg.worker.concurrency,

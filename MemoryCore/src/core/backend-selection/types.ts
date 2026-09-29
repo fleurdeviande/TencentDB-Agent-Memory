@@ -14,7 +14,7 @@
 
 import type { CosConfig, MongoConfig, VdbConfig } from "../instance-config-provider.js";
 
-export type DbKind = "sqlite" | "tcvdb" | "mongodb";
+export type DbKind = "sqlite" | "tcvdb" | "mongodb" | "postgres";
 
 /**
  * Env-surface vocabulary for `FILE_STORE_MODE` (两轴模型定稿 §5 映射的输入侧).
@@ -47,13 +47,15 @@ export type FsOthersKind = "local" | "cos" | "mongofs";
 /**
  * sqlite/local/mongofs carry `conn: null` on purpose:
  * - sqlite/local connection info is process-level (dataDir/baseDir), not per-instance;
+ * - postgres is process-level too (POSTGRES_URL); the instance picks its schema;
  * - mongofs reuses the DB dimension's MongoConfig (its chunks live in the same
  *   instance database as the memory store).
  */
 export type DbChoice =
   | { kind: "sqlite"; conn: null }
   | { kind: "tcvdb"; conn: VdbConfig }
-  | { kind: "mongodb"; conn: MongoConfig };
+  | { kind: "mongodb"; conn: MongoConfig }
+  | { kind: "postgres"; conn: null };
 
 export type FsOthersChoice =
   | { kind: "local"; conn: null }

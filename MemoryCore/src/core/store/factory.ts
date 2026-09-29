@@ -18,6 +18,7 @@ import { VectorStore } from "./sqlite/memory-store.js";
 import { TcvdbMemoryStore } from "./tcvdb/memory-store.js";
 import { MongoMemoryStore } from "./mongodb/memory-store.js";
 import { getSharedMongoClientPool } from "./mongodb/client-pool.js";
+import { createPostgresEmbeddingService, createPostgresStoreForInstance } from "./postgres/index.js";
 import { readMongoEnvConfig } from "../../utils/env-config.js";
 import { createEmbeddingService, NoopEmbeddingService } from "./embedding.js";
 import type { EmbeddingService } from "./embedding.js";
@@ -124,6 +125,20 @@ export function createStoreBundle(
           mongoEndpoint: mongoConfig.endpoint,
           mongoDatabase: mongoConfig.database,
         },
+      };
+    }
+
+    case "postgres": {
+      // Core/singleton path uses the "default" instance → base schema (same data the
+      // gateway's StorePool serves for instance "default").
+      const { store, schema, endpoint } = createPostgresStoreForInstance(config, "default", logger);
+      const embedding = createPostgresEmbeddingService(config.embedding, logger);
+      logger?.debug?.(`${TAG} Store created: backend=postgres, endpoint=${endpoint}, schema=${schema}`);
+      return {
+        store,
+        embedding: embedding as unknown as IEmbeddingService,
+        bm25Encoder,
+        storeSnapshot: { type: "postgres", postgresEndpoint: endpoint, postgresSchema: schema },
       };
     }
 
