@@ -17,6 +17,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type http from "node:http";
 import { classifyError } from "./error-handler.js";
+import { writeL0Records } from "./l0-write.js";
 import type { IMemoryStore, L0Record, ProfileSyncRecord } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
@@ -749,21 +750,8 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
     acceptedRecords.push(record);
   }
 
-  // Write path. One `/conversation/add` is one group of messages, so prefer a
-  // single batch insert when the store supports it AND no per-message embedding
-  // is required (keyword-only backends, e.g. Mongo). Otherwise fall back to the
-  // per-record upsert loop (sqlite/tcvdb, incl. vector embedding).
-  if (store.insertL0Batch && !embedding) {
-    await store.insertL0Batch(acceptedRecords);
-  } else {
-    for (const record of acceptedRecords) {
-      let emb: Float32Array | undefined;
-      if (embedding) {
-        try { emb = await embedding.embed(record.messageText); } catch (e) { console.warn(`[v2-router] L0 embedding failed:`, e); }
-      }
-      await store.upsertL0(record, emb);
-    }
-  }
+  // Rows first; vectors in the background where the store supports it (see l0-write.ts).
+  await writeL0Records(store, embedding, acceptedRecords, deps.logger);
 
   // Notify pipeline: trigger async L1 extraction (service mode).
   // Each role=user message counts as one conversation round for threshold/timer logic.

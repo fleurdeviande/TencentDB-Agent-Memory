@@ -657,3 +657,29 @@ pgfs objects live in each instance's schema (`POSTGRES_SCHEMA`, `<base>_i_<slug>
 | `postgres-diskless.gateway.test.ts` — real gateway, stub LLM: L0 → L1 → L2 → L3, data dir and HOME empty, pgfs holds the scoped checkpoint and L1 shards but no L0 mirror and no profile files; SIGKILL during an L1 call, the next process recovers and finishes the task; L0–L3 read back via `/v3`; graceful stop, dir still empty (~95 s) | 1/1 |
 | MemoryCore `npx vitest run` | 25 files, 316/316, exit 0; without a database (`POSTGRES_TEST_URL` unreachable): 141 passed, 74 skipped, exit 0 |
 | `tsc` on `src/gateway/server.ts` (strict, nodenext) | 187 errors before and after, same set (all upstream) |
+
+## Fixes found in the first NUE rollout
+
+### `/v3/conversation/add` no longer embeds inline (`src/gateway/l0-write.ts`)
+
+The handler embedded every message serially before answering: 100 messages against Ollama took 43–67 s,
+while the Claude Code hook gives a capture batch 15 s. The hook timed out, never saved its transcript
+position and resent batch one on every Stop/SessionEnd — on NUE one session left 800 L0 rows that were 100
+distinct messages × 8, and L1 spent ~80–130 s of GLM per 10 of them re-confirming the same stale facts.
+
+`writeL0Records()` now writes the rows first (`insertL0Batch`, else metadata-only `upsertL0`) and fills the
+vectors from a background task when the store has `supportsDeferredEmbedding` + `updateL0Embedding`
+(postgres, sqlite) — the same split auto-capture already used. Stores that need the vector up front keep the
+inline loop. `gateway.stop()` waits up to 20 s for pending vectors; a vector lost there only drops that message
+from vector recall (FTS still finds it). The hook's 15 s capture timeout stays: Claude Code kills the Stop hook
+at 15 s anyway, and a batch now answers in well under a second.
+
+Tests: `l0-write.test.ts` 5/5 (rows written without waiting, vectors after drain, one failed embedding keeps the
+rest, inline path for non-deferred stores, no-embedding path). MemoryCore `vitest run` with
+`POSTGRES_TEST_URL`: 27 files, 325/325.
+
+### pw-mcp: code-graph queries without tenant ids
+
+Knowledge whitelists the body of `/v3/code-graph/{search,explore,callers,callees,impact,node,status,files}` and
+answered every `code_*` tool with 400 `unexpected field: team_id`. The code-graph client now carries only the
+service id (a header); wiki routes still get `team_id`. pw-mcp tests 41/41.

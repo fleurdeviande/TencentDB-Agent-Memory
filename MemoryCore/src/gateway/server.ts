@@ -61,6 +61,7 @@ import { validateAndNormalizeRaw, SeedValidationError } from "../core/seed/input
 import { executeSeed } from "../core/seed/seed-runtime.js";
 import type { SeedProgress } from "../core/seed/types.js";
 import { handleV2Route, errorEnvelope, makeRequestId, V3_ALLOWED_SUBPATHS } from "./v2-router.js";
+import { drainL0Embeddings } from "./l0-write.js";
 import {
   bearerToken,
   enforcePersonalIdentity,
@@ -865,6 +866,10 @@ export class TdaiGateway {
     } catch {
       // Best-effort shutdown，不影响主流程
     }
+
+    // Let background L0 embeddings from conversation/add finish before stores close; capped to fit
+    // the pod's 30 s termination grace. A vector lost here only drops that message from vector recall.
+    await Promise.race([drainL0Embeddings(), new Promise((resolve) => setTimeout(resolve, 20_000).unref())]);
 
     // Stop integrated services first
     if (this.pipelineWorker) {
